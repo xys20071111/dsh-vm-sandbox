@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "VM sandbox (libkrun)",
+    "description": "Runs confined commands inside a lightweight libkrun VM: read-only image layer, persistent per-workspace data layer, and the workspace directory shared at the same path."
+  }
+}

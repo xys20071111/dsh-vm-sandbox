@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- 三层数据挂载隐喻：镜像层(下) / 数据层(中) / 工作区(上) -->
+  <rect x="8" y="38" width="48" height="14" rx="3" fill="#4a5568"/>
+  <rect x="12" y="24" width="40" height="12" rx="3" fill="#2b6cb0"/>
+  <rect x="16" y="12" width="32" height="10" rx="3" fill="#38a169"/>
+  <rect x="22" y="16" width="20" height="2.5" rx="1" fill="#c6f6d5"/>
+  <rect x="18" y="28" width="28" height="2.5" rx="1" fill="#bee3f8"/>
+  <rect x="14" y="42" width="36" height="2.5" rx="1" fill="#cbd5e0"/>
+  <rect x="14" y="47" width="24" height="2.5" rx="1" fill="#718096"/>
+</svg>

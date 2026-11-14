@@ -1,0 +1,5 @@
+# 本 bundle 的 provider 行（id: sandbox-vm）由用户补丁层接线：
+#   ~/.dsh/profiles/web/cordis.patch.yml —— 禁用 base bundle 的 sandbox 行 + 插入 sandbox-vm。
+# 原因：bundle 层的 id 覆盖先于官方层应用（无法命中 base bundle 的行），
+# 且 id 覆盖里的 truthy name 是断言而非改名。配置（imageRootfs/libDir 等）在用户层维护。
+- insert: []
