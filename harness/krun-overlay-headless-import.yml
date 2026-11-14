@@ -1,0 +1,24 @@
+# krun 激活级验证 overlay（headless 用）：绝对路径加载插件 + headless profile 的
+# 默认模型路由（headless 自身 patch 未配 agent-default-model）。
+# 用法：dsh headless --patch harness/krun-overlay-headless-test.yml "<task>"
+# 变体：空闲回收测试换 idleStopMs；只读拒绝测试加 --permission-mode read-only。
+- id: sandbox
+  disabled: true
+- id: agent-default-model
+  config:
+    provider: magpie-anthropic
+    model: zcode/GLM-5.3-Flash
+- insert:
+    - id: sandbox-vm
+      name: /home/xys/workspace/VibeCoding/sandbox/plugin/index.js
+      config:
+        enabled: true
+        imageRootfs: ""
+        libDir: /home/xys/opt/libkrun/lib
+        bootTimeoutMs: 20000
+        idleStopMs: 600000
+        network: none
+        portMap: []
+        resources:
+          vcpus: 2
+          ramMib: 2048

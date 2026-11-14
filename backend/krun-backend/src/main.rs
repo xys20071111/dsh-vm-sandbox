@@ -32,7 +32,33 @@ fn main() -> ExitCode {
 }
 
 /// exec 客户端：直连会话的 agent socket（VMM 监听桥接到 guest vsock），不过守护进程。
-/// 输出为子进程 stdout+stderr 合并流，末行 "EXIT:<code>"；本进程以该码退出。
+/// 请求 type=exec2：新 agent 回 {"ok":true,"stderr":"split"} 头 + 帧流
+/// （[tag u8][len u32 LE][payload]，tag 1=stdout、2=stderr、3=退出码）——stdout/stderr
+/// 分离是官方拒绝分类（matchesSignature 只查 stderr）的前提；旧 agent 无头，
+/// 整流为合并输出、末行 "EXIT:<code>"（M0 协议）。本进程以该码退出。
+fn parse_frames(data: &[u8]) -> (Vec<u8>, Vec<u8>, Option<i32>) {
+    // 跳过头部行
+    let mut i = data.iter().position(|&b| b == b'\n').map(|p| p + 1).unwrap_or(0);
+    let (mut so, mut se, mut code) = (Vec::new(), Vec::new(), None);
+    while i + 5 <= data.len() {
+        let tag = data[i];
+        let len = u32::from_le_bytes([data[i + 1], data[i + 2], data[i + 3], data[i + 4]]) as usize;
+        i += 5;
+        if i + len > data.len() {
+            break; // 截断流：保留已解出的部分
+        }
+        let payload = &data[i..i + len];
+        i += len;
+        match tag {
+            1 => so.extend_from_slice(payload),
+            2 => se.extend_from_slice(payload),
+            3 => code = std::str::from_utf8(payload).ok().and_then(|s| s.trim().parse().ok()),
+            _ => {}
+        }
+    }
+    (so, se, code)
+}
+
 fn cmd_exec(args: &[String]) -> ExitCode {
     let mut socket = None;
     let mut cwd: Option<String> = None;
@@ -51,23 +77,36 @@ fn cmd_exec(args: &[String]) -> ExitCode {
     let socket = socket.unwrap_or_else(|| { eprintln!("exec: --socket is required"); usage(); });
     if argv.is_empty() { eprintln!("exec: argv after -- is required"); usage(); }
 
+    // 命令 cwd：未显式给出时取本进程 getcwd()——executor 以每次调用的 workdir
+    // spawn 本客户端（LocalBashExecutor: cwd: spec.workdir），继承即语义正确；
+    // 工作区在 guest 内挂宿主机同绝对路径，路径互换无损。
+    let cwd = cwd.or_else(|| std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned()));
+
     let mut stream = std::os::unix::net::UnixStream::connect(&socket)
         .unwrap_or_else(|e| { eprintln!("exec: connect {socket}: {e}"); std::process::exit(1); });
-    let req = serde_json::json!({ "type": "exec", "argv": argv, "cwd": cwd, "env": envs });
+    let req = serde_json::json!({ "type": "exec2", "argv": argv, "cwd": cwd, "env": envs });
     writeln!(stream, "{req}").expect("send request");
 
     let mut out = Vec::new();
     std::io::Read::read_to_end(&mut stream, &mut out).expect("read agent stream");
-    let marker = b"\nEXIT:";
-    let (output, code) = match out.windows(marker.len()).rposition(|w| w == marker) {
-        Some(pos) => {
-            let code_str = String::from_utf8_lossy(&out[pos + marker.len()..])
-                .trim().trim_end_matches('\n').to_string();
-            (out[..pos + 1].to_vec(), code_str.trim().parse::<i32>().unwrap_or(125))
+    const SPLIT_HEADER: &[u8] = b"{\"ok\":true,\"stderr\":\"split\"}";
+    let (stdout_buf, stderr_buf, code) = if out.starts_with(SPLIT_HEADER) {
+        let (so, se, c) = parse_frames(&out);
+        (so, se, c.unwrap_or(125))
+    } else {
+        // 旧 agent（M0 合并协议）：整流为输出，末行 "EXIT:<code>"
+        let marker = b"\nEXIT:";
+        match out.windows(marker.len()).rposition(|w| w == marker) {
+            Some(pos) => {
+                let code_str = String::from_utf8_lossy(&out[pos + marker.len()..])
+                    .trim().trim_end_matches('\n').to_string();
+                (out[..pos + 1].to_vec(), Vec::new(), code_str.trim().parse::<i32>().unwrap_or(125))
+            }
+            None => (out, Vec::new(), 125), // 代理异常：无 EXIT 行
         }
-        None => (out, 125), // 代理异常：无 EXIT 行
     };
-    let _ = std::io::stdout().write_all(&output);
+    let _ = std::io::stdout().write_all(&stdout_buf);
+    let _ = std::io::stderr().write_all(&stderr_buf);
     if code < 0 { ExitCode::FAILURE } else { ExitCode::from(code as u8) }
 }
 

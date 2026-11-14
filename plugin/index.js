@@ -14,13 +14,13 @@
 // 镜像约定：imageRootfs 指向一个准备好的 Linux rootfs 目录树（只读使用）；
 // 引导前本插件把 guest/dsh-vm-agent 与 guest/setup.sh 烤入镜像树（幂等覆盖）。
 
-import { spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { execFile, spawn } from 'node:child_process';
+import { createHash, randomBytes } from 'node:crypto';
 import { connect as netConnect } from 'node:net';
-import { existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { chmodSync, createWriteStream, cpSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 
 import { SandboxProvider, SandboxUnavailableError, canonicalPath } from '@deepseek-ai/dsh-sandbox';
 import z from '@deepseek-ai/schemastery';
@@ -38,6 +38,147 @@ function sessionKey(ws, mode) {
   h.update('\0');
   h.update(mode);
   return h.digest('hex').slice(0, 16);
+}
+
+/** 镜像注册表：<dataDir>/registry.json —— 工作区绑定（workspace 绝对路径 → imageId）。
+ *  多进程（live/headless）并发写经原子替换（tmp + rename）序列化，见设计 §14.8。 */
+const REGISTRY = {
+  path(dataDir) { return join(dataDir, 'registry.json'); },
+  read(dataDir) {
+    try {
+      const raw = JSON.parse(readFileSync(REGISTRY.path(dataDir), 'utf8'));
+      return { workspaces: raw.workspaces && typeof raw.workspaces === 'object' ? raw.workspaces : {} };
+    } catch { return { workspaces: {} }; }
+  },
+  write(dataDir, reg) {
+    mkdirSync(dataDir, { recursive: true });
+    const tmp = `${REGISTRY.path(dataDir)}.tmp-${process.pid}-${randomBytes(3).toString('hex')}`;
+    writeFileSync(tmp, `${JSON.stringify(reg, null, 2)}\n`);
+    renameSync(tmp, REGISTRY.path(dataDir));
+  },
+};
+
+/** execFile 的 Promise 包装（tar/du/apk 等外部工具）。 */
+function runFile(file, args, opts = {}) {
+  return new Promise((res, rej) => {
+    execFile(file, args, { timeout: 600000, ...opts }, (err, stdout, stderr) => {
+      if (err) { err.stderr = stderr; rej(err); } else res(stdout);
+    });
+  });
+}
+
+/** 解包 rootfs tarball（tar 自动识别 gz/xz/zst 压缩）。 */
+async function extractRootfsTar(tarPath, dest) {
+  await runFile('tar', ['-xf', tarPath, '-C', dest]);
+}
+
+/** 下载 URL 到临时文件（宿主网络直连）。 */
+async function downloadTo(url, dest) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`download ${url}: HTTP ${r.status}`);
+  writeFileSync(dest, Buffer.from(await r.arrayBuffer()));
+  return dest;
+}
+
+/** 容器导出（docker/podman export 的 tar 流落盘）。 */
+function containerExportTar(engine, container, destTar) {
+  return new Promise((res, rej) => {
+    const p = spawn(engine, ['export', container], { stdio: ['ignore', 'pipe', 'inherit'] });
+    const out = createWriteStream(destTar);
+    p.stdout.pipe(out);
+    p.on('error', rej);
+    p.on('exit', (code) => (code === 0 ? res() : rej(new Error(`${engine} export ${container} exited ${code}`))));
+    out.on('error', rej);
+  });
+}
+
+/** Alpine 系镜像免 root 装 bash（M1 实测的 loader 技巧）；非 Alpine/已有 bash 时跳过。
+ *  判定以 bash 二进制落地为准——apk 对 chroot 触发器报 EPERM 可忽略（无真 chroot）。 */
+async function ensureBash(rootfs) {
+  const hasBash = () => existsSync(join(rootfs, 'bin', 'bash')) || existsSync(join(rootfs, 'usr', 'bin', 'bash'));
+  try {
+    if (hasBash()) return { ok: true };
+    const apk = join(rootfs, 'sbin', 'apk');
+    const libs = join(rootfs, 'lib');
+    const loader = existsSync(libs)
+      ? readdirSync(libs).find((f) => f.startsWith('ld-musl-'))
+      : undefined;
+    if (!existsSync(apk) || !loader) return { ok: false, warning: null };
+    let stderr = '';
+    try {
+      await runFile(join(libs, loader), [apk, '--root', rootfs, 'add', 'bash'], {
+        env: { LD_LIBRARY_PATH: `${libs}:${join(rootfs, 'usr', 'lib')}`, PATH: '/usr/bin:/bin' },
+        timeout: 300000,
+      });
+    } catch (e) {
+      stderr = String(e?.stderr || e?.message || e);
+    }
+    return hasBash()
+      ? { ok: true }
+      : { ok: false, warning: stderr.slice(0, 300) || 'apk add bash produced no binary' };
+  } catch (e) {
+    return { ok: false, warning: String(e?.stderr || e?.message || e).slice(0, 300) };
+  }
+}
+
+/** 目录树占用字节数（du -sb）。 */
+async function duBytes(path) {
+  try {
+    const out = await runFile('du', ['-sb', path], { timeout: 120000 });
+    return Number.parseInt(out.split('\t')[0], 10) || 0;
+  } catch { return 0; }
+}
+
+/** 镜像库根：<dataDir>/images/<imageId>/{manifest.json, rootfs}（设计 §6）。 */
+function imagesDir(dataDir) {
+  return join(dataDir, 'images');
+}
+
+/** 镜像导入核心（纯文件操作，独立于 cordis 上下文，可独立调用/测试）。
+ *  来源 v1（设计 §6）：tarball 本地路径 / URL / 目录树 / 容器导出（docker|podman）。 */
+async function runImportJob(dataDir, job, req, diag = () => {}) {
+  const id = `img-${Date.now().toString(36)}-${randomBytes(3).toString('hex')}`;
+  const imgDir = join(imagesDir(dataDir), id);
+  const rootfs = join(imgDir, 'rootfs');
+  mkdirSync(rootfs, { recursive: true });
+  let source;
+  if (job.kind === 'tarball' || job.kind === 'url') {
+    const src = job.kind === 'url'
+      ? await downloadTo(String(req.url), join(mkdtempSync(join(tmpdir(), 'krun-import-')), 'image.tar'))
+      : expandHome(String(req.path));
+    await extractRootfsTar(src, rootfs);
+    source = job.kind === 'url' ? String(req.url) : String(req.path);
+  } else if (job.kind === 'dir') {
+    const src = expandHome(String(req.path));
+    if (!existsSync(src)) throw new Error(`source directory missing: ${src}`);
+    cpSync(src, rootfs, { recursive: true });
+    source = String(req.path);
+  } else {
+    const engine = String(req.engine ?? '') || (existsSync('/usr/bin/podman') ? 'podman' : 'docker');
+    const tar = join(mkdtempSync(join(tmpdir(), 'krun-import-')), 'image.tar');
+    await containerExportTar(engine, String(req.container), tar);
+    await extractRootfsTar(tar, rootfs);
+    source = `${engine}:${String(req.container)}`;
+  }
+  const bash = await ensureBash(rootfs);
+  const manifest = {
+    id,
+    name: String(req.name ?? '') || basename(source || id),
+    distro: String(req.distro ?? '') || (existsSync(join(rootfs, 'etc', 'alpine-release')) ? 'alpine' : 'linux'),
+    arch: process.arch,
+    created: new Date().toISOString(),
+    source: `${job.kind}:${source ?? ''}`,
+    format: 'dir',
+    sizeBytes: await duBytes(imgDir),
+    bashReady: bash.ok,
+    ...(bash.warning ? { warning: bash.warning } : {}),
+  };
+  writeFileSync(join(imgDir, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
+  job.status = 'done';
+  job.imageId = id;
+  job.manifest = manifest;
+  diag(`import done ${id} (${manifest.name})`);
+  return manifest;
 }
 
 export class KrunSandboxProvider extends SandboxProvider {
@@ -92,6 +233,8 @@ export class KrunSandboxProvider extends SandboxProvider {
     this.sessions = new Map();
     /** 单飞引导：同一 key 的并发 confine 共享一次启动 */
     this.booting = new Map();
+    /** 镜像导入任务表：jobId → { id, kind, label, status, startedAt, error?, imageId?, manifest? } */
+    this.krunJobs = new Map();
     this.krunProbeCache = undefined;
     this.krunDiag(`constructor pid=${process.pid}`);
     this.krunWorkingDirectory = ctx.workingDirectory;
@@ -102,6 +245,11 @@ export class KrunSandboxProvider extends SandboxProvider {
     ctx.inject(['webServer'], (injectCtx) => {
       this.krunDiag('webServer inject callback fired');
       this.krunRegisterRoutes(injectCtx.webServer);
+    });
+    // 人类命令（§8.2）：commands 为 base bundle 根作用域服务，此处注册为全局命令。
+    ctx.inject(['commands'], (injectCtx) => {
+      this.krunDiag('commands inject callback fired');
+      this.krunRegisterCommands(injectCtx);
     });
   }
 
@@ -128,10 +276,14 @@ export class KrunSandboxProvider extends SandboxProvider {
         resources: this.krunConfig.resources,
       },
       sessions: [...this.sessions.values()].map((s) => ({
-        key: s.key, ws: s.ws, mode: s.mode,
+        key: s.key, ws: s.ws, mode: s.mode, image: s.image,
         alive: !s.child.killed,
         uptimeMs: Date.now() - (s.startedAt ?? Date.now()),
+        idleMs: Date.now() - (s.lastUse ?? Date.now()),
       })),
+      images: this.krunListImages(),
+      workspaces: REGISTRY.read(this.krunDataDir).workspaces,
+      jobs: [...this.krunJobs.values()].slice(-20),
     });
     const registerRoute = (route, label) => {
       try {
@@ -176,23 +328,335 @@ export class KrunSandboxProvider extends SandboxProvider {
         sendJson(res, 200, { ok: true, probe: (await this.probe()) });
       },
     }, 'krun-vm: POST /api/krun/probe');
+    registerRoute({
+      kind: 'exact',
+      path: '/api/krun/images',
+      handler: async (req, res) => {
+        if (req.method !== 'GET') { res.writeHead(405); res.end(); return; }
+        sendJson(res, 200, {
+          ok: true,
+          images: this.krunListImages(),
+          jobs: [...this.krunJobs.values()].slice(-20),
+          workspaces: REGISTRY.read(this.krunDataDir).workspaces,
+        });
+      },
+    }, 'krun-vm: GET /api/krun/images');
+    registerRoute({
+      kind: 'exact',
+      path: '/api/krun/images/import',
+      handler: async (req, res) => {
+        if (req.method !== 'POST') { res.writeHead(405); res.end(); return; }
+        const body = await readBody(req);
+        const running = [...this.krunJobs.values()].find((j) => j.status === 'running');
+        if (running) { sendJson(res, 409, { ok: false, err: `import job ${running.id} is running` }); return; }
+        const kind = String(body.kind ?? '');
+        if (!['tarball', 'url', 'dir', 'container'].includes(kind)) {
+          sendJson(res, 400, { ok: false, err: `kind must be tarball|url|dir|container, got ${kind || '(empty)'}` });
+          return;
+        }
+        if (kind === 'container' && !String(body.container ?? '').trim()) {
+          sendJson(res, 400, { ok: false, err: 'container name is required' });
+          return;
+        }
+        if (kind === 'url' && !String(body.url ?? '').trim()) {
+          sendJson(res, 400, { ok: false, err: 'url is required' });
+          return;
+        }
+        if ((kind === 'tarball' || kind === 'dir') && !String(body.path ?? '').trim()) {
+          sendJson(res, 400, { ok: false, err: 'path is required' });
+          return;
+        }
+        const job = {
+          id: `job-${Date.now().toString(36)}-${randomBytes(2).toString('hex')}`,
+          kind,
+          label: String(body.name ?? body.path ?? body.container ?? kind),
+          status: 'running',
+          startedAt: Date.now(),
+        };
+        this.krunJobs.set(job.id, job);
+        // 异步执行：HTTP 立即返回 jobId，进度经 /api/krun/status|images 轮询
+        this.krunRunImport(job, body).catch((err) => {
+          job.status = 'error';
+          job.error = String(err?.message ?? err);
+        });
+        sendJson(res, 200, { ok: true, jobId: job.id });
+      },
+    }, 'krun-vm: POST /api/krun/images/import');
+    registerRoute({
+      kind: 'exact',
+      path: '/api/krun/images/delete',
+      handler: async (req, res) => {
+        if (req.method !== 'POST') { res.writeHead(405); res.end(); return; }
+        const body = await readBody(req);
+        const id = String(body.id ?? '');
+        sendJson(res, 200, { ok: true, ...(await this.krunDeleteImage(id)) });
+      },
+    }, 'krun-vm: POST /api/krun/images/delete');
+    registerRoute({
+      kind: 'exact',
+      path: '/api/krun/workspaces/bind',
+      handler: async (req, res) => {
+        if (req.method !== 'POST') { res.writeHead(405); res.end(); return; }
+        const body = await readBody(req);
+        const ws = String(body.ws ?? '');
+        const imageId = String(body.imageId ?? '');
+        const rootfs = join(this.krunImagesDir(), imageId, 'rootfs');
+        if (!ws.startsWith('/') || !existsSync(rootfs)) {
+          sendJson(res, 400, { ok: false, err: `invalid ws or unknown image ${imageId}` });
+          return;
+        }
+        const reg = REGISTRY.read(this.krunDataDir);
+        reg.workspaces[ws] = { imageId, boundAt: new Date().toISOString() };
+        REGISTRY.write(this.krunDataDir, reg);
+        this.krunDiag(`bind ${ws} -> ${imageId}`);
+        sendJson(res, 200, { ok: true });
+      },
+    }, 'krun-vm: POST /api/krun/workspaces/bind');
+    registerRoute({
+      kind: 'exact',
+      path: '/api/krun/workspaces/unbind',
+      handler: async (req, res) => {
+        if (req.method !== 'POST') { res.writeHead(405); res.end(); return; }
+        const body = await readBody(req);
+        const ws = String(body.ws ?? '');
+        const reg = REGISTRY.read(this.krunDataDir);
+        if (!reg.workspaces[ws]) { sendJson(res, 404, { ok: false, err: 'not bound' }); return; }
+        delete reg.workspaces[ws];
+        REGISTRY.write(this.krunDataDir, reg);
+        sendJson(res, 200, { ok: true });
+      },
+    }, 'krun-vm: POST /api/krun/workspaces/unbind');
+    registerRoute({
+      kind: 'exact',
+      path: '/api/krun/workspaces/reset',
+      handler: async (req, res) => {
+        if (req.method !== 'POST') { res.writeHead(405); res.end(); return; }
+        const body = await readBody(req);
+        sendJson(res, 200, this.krunResetWorkspaceData(String(body.ws ?? '')));
+      },
+    }, 'krun-vm: POST /api/krun/workspaces/reset');
   }
 
-  /** 空闲回收：无活跃终端且超过 idleStopMs 的会话优雅停机（数据层天然落盘）。 */
-  krunGcIdle() {
-    const idle = this.krunConfig.idleStopMs ?? 600000;
-    if (!idle) return;
-    const now = Date.now();
-    for (const [key, s] of this.sessions) {
-      if ((s.liveTerminals ?? 0) > 0) continue;
-      if (now - (s.lastUse ?? now) > idle) {
-        s.child.kill('SIGTERM');
-        this.sessions.delete(key);
+  /** 镜像库：<dataDir>/images/<imageId>/{manifest.json, rootfs}（设计 §6）。 */
+  krunImagesDir() {
+    return imagesDir(this.krunDataDir);
+  }
+
+  krunListImages() {
+    const dir = this.krunImagesDir();
+    let ids = [];
+    try {
+      ids = readdirSync(dir).filter((e) => existsSync(join(dir, e, 'manifest.json')));
+    } catch { /* 目录不存在 = 无镜像 */ }
+    const reg = REGISTRY.read(this.krunDataDir);
+    const refCount = {};
+    for (const b of Object.values(reg.workspaces)) {
+      if (b?.imageId) refCount[b.imageId] = (refCount[b.imageId] ?? 0) + 1;
+    }
+    return ids.map((id) => {
+      try {
+        const m = JSON.parse(readFileSync(join(dir, id, 'manifest.json'), 'utf8'));
+        return { ...m, id, refCount: refCount[id] ?? 0 };
+      } catch {
+        return { id, name: id, error: 'manifest unreadable', refCount: refCount[id] ?? 0 };
       }
+    });
+  }
+
+  /** 引导镜像解析：工作区绑定 → 配置 imageRootfs（遗留单镜像路径，兼容既有部署）。 */
+  krunResolveImage(ws) {
+    const binding = REGISTRY.read(this.krunDataDir).workspaces[ws];
+    if (binding?.imageId) {
+      const rootfs = join(this.krunImagesDir(), binding.imageId, 'rootfs');
+      if (existsSync(rootfs)) return rootfs;
+    }
+    const legacy = expandHome(this.krunConfig.imageRootfs);
+    if (legacy && existsSync(legacy)) return legacy;
+    return null;
+  }
+
+  /** 镜像导入任务（HTTP 层薄封装；核心见 runImportJob）。 */
+  async krunRunImport(job, req) {
+    await runImportJob(this.krunDataDir, job, req, (m) => this.krunDiag(m));
+  }
+
+  /** 删除镜像：有绑定或运行中会话引用时拒绝（设计 §6 user-only 语义）。 */
+  async krunDeleteImage(id) {
+    if (!/^[A-Za-z0-9_-]+$/.test(id)) return { ok: false, err: `invalid image id ${id}` };
+    const reg = REGISTRY.read(this.krunDataDir);
+    const boundWs = Object.keys(reg.workspaces).filter((ws) => reg.workspaces[ws]?.imageId === id);
+    if (boundWs.length > 0) return { ok: false, err: `bound by ${boundWs.length} workspace(s): ${boundWs.join(', ')}` };
+    const imgDir = join(this.krunImagesDir(), id);
+    for (const s of this.sessions.values()) {
+      if (s.image === join(imgDir, 'rootfs')) return { ok: false, err: `in use by running session ${s.key}` };
+    }
+    if (!existsSync(imgDir)) return { ok: false, err: `unknown image ${id}` };
+    rmSync(imgDir, { recursive: true, force: true });
+    this.krunDiag(`image deleted ${id}`);
+    return { ok: true };
+  }
+
+  /** 丢弃工作区数据层（容器级重置）：停会话 + 删数据盘。user-only 破坏类操作。 */
+  krunResetWorkspaceData(ws) {
+    if (!ws.startsWith('/')) return { ok: false, err: 'ws must be an absolute path' };
+    const stopped = [];
+    const removed = [];
+    for (const [key, s] of [...this.sessions]) {
+      if (s.ws !== ws) continue;
+      s.child.kill('SIGTERM');
+      this.sessions.delete(key);
+      stopped.push(`${key}(${s.mode})`);
+    }
+    for (const mode of ['ro', 'rw']) {
+      const img = join(this.krunDataDir, 'workspaces', `${sessionKey(ws, mode)}.img`);
+      if (existsSync(img)) {
+        rmSync(img, { force: true });
+        removed.push(img);
+      }
+    }
+    this.krunDiag(`reset ${ws}: stopped=[${stopped.join(',')}] removed=${removed.length}`);
+    return { ok: true, stopped, removed };
+  }
+
+  /** /vm 命令组（设计 §8.2）：一个注册项解析 status|stop|reset 三个子命令。 */
+  krunRegisterCommands(injectCtx) {
+    const def = {
+      name: 'vm',
+      description: 'VM 沙盒（libkrun）管理：状态 / 停止会话 / 重置工作区数据层',
+      input: { hint: 'status | stop [all|<key>|ro|rw] | reset confirm' },
+      handler: async (invocation) => this.krunVmCommand(invocation),
+    };
+    try {
+      this.krunCtx.effect(() => {
+        this.krunDiag('registered /vm');
+        return injectCtx.commands.register(def);
+      }, 'krun-vm: /vm command');
+    } catch (err) {
+      this.krunDiag(`register /vm THREW: ${err?.message ?? err}`);
     }
   }
 
-  /** 环境探测（结果缓存到实例生命周期）：KVM 可用、后端与镜像就绪。 */
+  async krunVmCommand(invocation) {
+    const parts = invocation.rawInput.trim().split(/\s+/).filter(Boolean);
+    const sub = parts[0] ?? 'status';
+    try {
+      if (sub === 'status') return { kind: 'success', text: await this.krunVmStatusText(invocation) };
+      if (sub === 'stop') return this.krunVmStop(parts[1]);
+      if (sub === 'reset') return await this.krunVmReset(invocation, parts[1] === 'confirm');
+      return { kind: 'error', text: '用法：/vm status ｜ /vm stop [all|<key>|ro|rw] ｜ /vm reset confirm' };
+    } catch (err) {
+      return { kind: 'error', text: `vm: ${err?.message ?? err}` };
+    }
+  }
+
+  async krunVmStatusText(invocation) {
+    const lines = [];
+    const probe = this.krunProbeCache ?? await this.probe();
+    lines.push(`环境：${probe.ok ? '可用' : `不可用（${probe.detail}）`}`);
+    const images = this.krunListImages();
+    const legacy = expandHome(this.krunConfig.imageRootfs);
+    lines.push(`镜像：${images.length} 个导入镜像${legacy && existsSync(legacy) ? ' ＋ 默认 imageRootfs' : ''}`);
+    for (const im of images) {
+      lines.push(`  - ${im.name} (${im.id}) · ${im.arch} · ${Math.round((im.sizeBytes ?? 0) / 1048576)}MiB · 引用 ${im.refCount}`);
+    }
+    const sessions = [...this.sessions.values()];
+    lines.push(`会话：${sessions.length} 个${this.krunConfig.network === 'none' ? ' · network=none' : ' · network=tsi'}`);
+    for (const s of sessions) {
+      lines.push(`  - ${s.key} · ${s.mode} · ${s.ws} · 运行 ${Math.round((Date.now() - (s.startedAt ?? Date.now())) / 1000)}s`);
+    }
+    const reg = REGISTRY.read(this.krunDataDir);
+    const wsKeys = Object.keys(reg.workspaces);
+    if (wsKeys.length > 0) {
+      lines.push(`工作区绑定：${wsKeys.length} 个`);
+      for (const ws of wsKeys) lines.push(`  - ${ws} → ${reg.workspaces[ws].imageId}`);
+    }
+    if (invocation) {
+      try {
+        const ws = await this.krunWorkingDirectory.ensure(invocation.agent, invocation.signal);
+        const binding = reg.workspaces[ws];
+        lines.push(`当前工作区：${ws}${binding ? `（绑定 ${binding.imageId}）` : '（默认镜像）'}`);
+      } catch { /* 会话无工作区时跳过 */ }
+    }
+    return lines.join('\n');
+  }
+
+  krunVmStop(filter) {
+    const targets = [...this.sessions.values()].filter((s) => {
+      if (!filter || filter === 'all') return true;
+      if (filter === 'ro' || filter === 'rw') return s.mode === filter;
+      return s.key.startsWith(filter);
+    });
+    if (targets.length === 0) return { kind: 'error', text: `无匹配会话（${filter ?? 'all'}）；当前 ${this.sessions.size} 个` };
+    for (const s of targets) {
+      s.child.kill('SIGTERM');
+      this.sessions.delete(s.key);
+    }
+    return { kind: 'success', text: `已停止 ${targets.length} 个会话：${targets.map((s) => `${s.key}(${s.mode})`).join(', ')}` };
+  }
+
+  async krunVmReset(invocation, confirmed) {
+    const ws = await this.krunWorkingDirectory.ensure(invocation.agent, invocation.signal);
+    const dataImgs = ['ro', 'rw']
+      .map((mode) => join(this.krunDataDir, 'workspaces', `${sessionKey(ws, mode)}.img`))
+      .filter((p) => existsSync(p));
+    const live = [...this.sessions.values()].filter((s) => s.ws === ws);
+    if (!confirmed) {
+      const lines = [
+        `将重置工作区数据层：${ws}`,
+        `  停止会话：${live.length > 0 ? live.map((s) => `${s.key}(${s.mode})`).join(', ') : '（无）'}`,
+        `  删除数据层：${dataImgs.length > 0 ? dataImgs.join(', ') : '（无数据层文件）'}`,
+        '该操作丢弃 VM 内生成的系统级数据（apt 安装、编译产物等），不可恢复；工作区目录本身不受影响。',
+        '确认执行请输入：/vm reset confirm',
+      ];
+      return { kind: 'success', text: lines.join('\n') };
+    }
+    const result = this.krunResetWorkspaceData(ws);
+    return result.ok
+      ? { kind: 'success', text: `已重置：停止 ${result.stopped.length} 个会话，删除 ${result.removed.length} 个数据层文件。下次命令将重新引导空白数据层。` }
+      : { kind: 'error', text: `重置失败：${result.err}` };
+  }
+
+  /** agent 活跃连接查询（stat 协议，agent v2）；旧 agent/VM 已退出时返回 null。 */
+  krunAgentStat(session, timeoutMs = 1500) {
+    return new Promise((res) => {
+      let buf = '';
+      const s = netConnect({ path: session.agentSock }, () => {
+        s.write(`${JSON.stringify({ type: 'stat' })}\n`);
+      });
+      const timer = setTimeout(() => { s.destroy(); res(null); }, timeoutMs);
+      s.on('data', (d) => {
+        buf += d;
+        const nl = buf.indexOf('\n');
+        if (nl < 0) return;
+        clearTimeout(timer);
+        s.destroy();
+        try { res(JSON.parse(buf.slice(0, nl))); } catch { res(null); }
+      });
+      s.on('error', () => { clearTimeout(timer); res(null); });
+    });
+  }
+
+  /** 空闲回收：无活跃终端/连接且超过 idleStopMs 的会话优雅停机（数据层天然落盘）。
+   *  活跃连接判定：liveTerminals（本 provider 的终端）∪ agent stat（exec/term 连接，
+   *  覆盖 run_in_background 长驻子进程持有的连接，设计 §7"无活动连接"语义）。 */
+  async krunGcIdle() {
+    const idle = this.krunConfig.idleStopMs ?? 600000;
+    if (!idle) return;
+    const now = Date.now();
+    for (const [key, s] of [...this.sessions]) {
+      if ((s.liveTerminals ?? 0) > 0) continue;
+      if (now - (s.lastUse ?? now) <= idle) continue;
+      const stat = await this.krunAgentStat(s);
+      if (stat && (stat.execConns > 0 || stat.termConns > 0)) {
+        s.lastUse = now; // 有活动连接：视为在用，刷新计时
+        continue;
+      }
+      s.child.kill('SIGTERM');
+      this.sessions.delete(key);
+    }
+  }
+
+  /** 环境探测（结果缓存到实例生命周期）：KVM 可用、后端就绪、镜像可用。 */
   async probe() {
     if (this.krunProbeCache) return this.krunProbeCache;
     const problems = [];
@@ -205,9 +669,11 @@ export class KrunSandboxProvider extends SandboxProvider {
       problems.push('/dev/kvm not accessible');
     }
     if (!existsSync(this.krunBackendPath)) problems.push(`backend missing: ${this.krunBackendPath}`);
-    const imageRootfs = expandHome(this.krunConfig.imageRootfs);
-    if (!imageRootfs || !existsSync(imageRootfs)) {
-      problems.push(`imageRootfs not configured or missing: ${imageRootfs || '(empty)'}`);
+    // 镜像可用性：默认 imageRootfs（遗留路径）或已导入镜像任一即可
+    const legacy = expandHome(this.krunConfig.imageRootfs);
+    const imported = this.krunListImages();
+    if ((!legacy || !existsSync(legacy)) && imported.length === 0) {
+      problems.push('no image: imageRootfs not configured/missing and no imported images');
     }
     this.krunProbeCache = { ok: problems.length === 0, detail: problems.join('; ') };
     return this.krunProbeCache;
@@ -275,7 +741,11 @@ export class KrunSandboxProvider extends SandboxProvider {
     const probe = await this.probe();
     if (!probe.ok) throw new SandboxUnavailableError(policy.mode, `krun VM unavailable — ${probe.detail}`);
 
-    const imageRootfs = expandHome(this.krunConfig.imageRootfs);
+    // 镜像解析：工作区绑定 → 默认 imageRootfs（无镜像 fail-closed）
+    const imageRootfs = this.krunResolveImage(ws);
+    if (!imageRootfs) {
+      throw new SandboxUnavailableError(policy.mode, `krun VM unavailable — no image for ${ws} (import an image or set imageRootfs)`);
+    }
     this.bakeGuestFiles(imageRootfs);
 
     const runDir = join(this.krunDataDir, 'run');
@@ -316,7 +786,7 @@ export class KrunSandboxProvider extends SandboxProvider {
     });
     out.close?.();
 
-    const session = { key, child, agentSock: sockPath, ws, mode, logPath, lastUse: Date.now(), startedAt: Date.now(), liveTerminals: 0 };
+    const session = { key, child, agentSock: sockPath, ws, mode, image: imageRootfs, logPath, lastUse: Date.now(), startedAt: Date.now(), liveTerminals: 0 };
     const aborter = new AbortController();
     const onAbort = () => aborter.abort();
     signal?.addEventListener('abort', onAbort, { once: true });
@@ -348,14 +818,15 @@ export class KrunSandboxProvider extends SandboxProvider {
       throw new SandboxUnavailableError(policy.mode, 'danger-full-access must bypass the sandbox provider');
     }
     const session = await this.ensureSession(policy, signal);
-    // 命令的宿主 cwd（executor 以会话 cwd spawn 本 argv）与 guest 内路径相同
-    const cwd = process.cwd();
+    // exec 路径同样计入活跃（GC 计时刷新）；executor 以每次调用的 workdir spawn
+    // 返回的 argv（LocalBashExecutor: cwd: spec.workdir），命令 cwd 由 krun-backend
+    // exec 客户端以自身 getcwd() 取得——工作区在 guest 内挂同绝对路径，无需映射。
+    session.lastUse = Date.now();
     return {
       argv: [
         this.krunBackendPath,
         'exec',
         '--socket', session.agentSock,
-        '--cwd', cwd,
         '--env', `DSH_SANDBOX_MODE=${policy.mode}`,
         '--',
         ...argv,
@@ -541,4 +1012,6 @@ class KrunTerminalSession {
   }
 }
 
-export { KrunSandboxProvider as default, KrunTerminalBackend };
+// 导出：REGISTRY/runImportJob/imagesDir 供独立测试与脚本使用（镜像管理是纯文件操作，
+// 不经 cordis 上下文；见设计 §4.1 职责分界）。
+export { KrunSandboxProvider as default, KrunTerminalBackend, REGISTRY, runImportJob, imagesDir };

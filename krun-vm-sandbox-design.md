@@ -394,24 +394,27 @@ class KrunVmService extends Service {
 | 阶段 | 状态 | 说明 |
 |---|---|---|
 | M0 可行性尖峰 | ✅ | libkrun 用户前缀引导、直接依赖、argv 约定、guest 编排、vsock 回环全通（附录 C 前段） |
-| M1 核心接缝 | ✅ | confined bash 落 VM、fail-closed、EROFS 拒绝方言、dump-config 行覆盖、E2E（15:37 与当日复验） |
-| M2 持久化与终端 | ▲ | 持久化/双会话/网络档位 ✅；Web 终端注册器就绪待实测（坑 7/8）；空闲回收待日常观察 |
-| M3 管理界面 | ▲ | settings.section 页 + 状态芯片 + `/api/krun/*` 路由 ✅；`/vm` 命令组未实现 |
-| M4 打磨 | ✗ | 镜像管理、qcow2、aarch64、诊断 skill、README 之外的文档化均未开始 |
+| M1 核心接缝 | ✅ | confined bash 落 VM、fail-closed、EROFS 拒绝方言、dump-config 行覆盖、E2E（15:37 与当日复验）；**stderr 分离修复后拒绝标记/升级提示闭环**（23:0x 复测；GUI 批准升级步待用户） |
+| M2 持久化与终端 | ✅ | 持久化/双会话/网络档位 ✅；空闲回收实测 ✅（stat 活跃连接保护 + 数据层跨回收保留）；run_in_background 跨调用 ✅；Web 终端注册器就绪待实测（坑 7/8） |
+| M3 管理界面 | ▲ | settings.section 页 + 状态芯片 + `/api/krun/*` 路由 ✅；`/vm` 命令组 ✅（headless 激活 + 处理器直测）；浏览器实测待用户复核 |
+| M4 打磨 | ▲ | 镜像管理 v1 ✅（URL/tarball/dir/容器导入 + 注册表绑定 + 管理页两卡 + E2E）；qcow2、aarch64、诊断 skill、README 之外的文档化待做 |
 
 ### 15.2 运行形态（当前 live 配置）
 
 - provider 直 spawn `boot` 子进程（一 VM 一进程，`serve` 守护进程层未接线——设计偏差见附录 D）
 - `network: none`（用户要求零宿主端口占用；切 `tsi` 即得共享宿主网络 + 自动端口暴露）
-- 资源 2 vCPU / 2048 MiB，`idleStopMs` 600000（空闲回收 fiber effect 已接）
+- 资源 2 vCPU / 2048 MiB，`idleStopMs` 600000（空闲回收 fiber effect 已接 + agent stat 活跃连接保护）
 - 数据层：`~/.dsh-krun/workspaces/<ws+mode 哈希>.img`（8.5G 稀疏，ext4 upper）
-- 镜像：Alpine minirootfs 目录树（`~/opt/krun-m0/images/alpine/rootfs`，boot 时自动烤入 agent/setup/resolv.conf）
+- 镜像：默认 imageRootfs = Alpine minirootfs 目录树（`~/opt/krun-m0/images/alpine/rootfs`，boot 时自动烤入 agent/setup/resolv.conf）；另支持 `<dataDir>/images/<id>/` 导入镜像 + `registry.json` 工作区绑定（解析顺序 = 绑定 → imageRootfs）
+- agent 协议 v2：exec2 帧（stdout/stderr/退出码分离）+ stat（活跃连接）；旧 agent 自动回退合并流
 
 ### 15.3 已验证能力（证据见附录 C）
 
-持久化跨 VM/跨 dsh 重启；ro EROFS 拒绝（命中 denialSignatures）；ro/rw 双会话并存；
-`--network tsi|none` 双档（出站 TCP+DNS / 零端口占用）；TSI 入站自动端口暴露全链路；
-`exec --env` 到达 guest；管理页路由三联注册；三预设覆写组合（standard/ptc/minimal）。
+持久化跨 VM/跨 dsh 重启；ro EROFS 拒绝（命中 denialSignatures，官方拒绝标记/升级提示闭环）；
+ro/rw 双会话并存；`--network tsi|none` 双档（出站 TCP+DNS / 零端口占用）；TSI 入站自动端口暴露全链路；
+`exec --env` 到达 guest；管理页路由三联注册；三预设覆写组合（standard/ptc/minimal）；
+空闲回收（stat 活跃连接保护 + 数据层跨回收保留）；run_in_background 跨调用存活；
+`/vm` 命令组；镜像导入→绑定→引导 E2E（Alpine 3.22 minirootfs）。
 
 ### 15.4 已知限制与偏差（如实）
 
@@ -421,6 +424,7 @@ class KrunVmService extends Service {
 - `serve` 守护进程形态未接线（provider 直 spawn boot）
 - cordis 预设（创造模式）按用户要求未接入终端组
 - busybox 测试坑：nc 遇 stdin EOF 即退（`punt!`）、无 httpd applet——均非沙盒问题
+- exec2 帧协议为 v2 增量：旧镜像内 agent 走合并流回退（stderr 不分离 → 拒绝分类失效），boot 时 bakeGuestFiles 自动烤入新 agent，滚动更新自愈
 
 ### 15.5 排障手段
 
@@ -474,6 +478,52 @@ class KrunVmService extends Service {
   - **E2E 证据**（真实 DSH 会话 bash → VM）：`Linux localhost 6.12.115 …`（libkrunfw 内核）、`uid=0(root)`、`/dsh-setup` 存在、`/proc/mounts` 含 1 条 overlay、EXIT_CODE=0；harness 侧 `~/.dsh-krun/{run,logs,workspaces}` 工件齐全、VM 会话常驻。
   - fail-closed 实测：boot 失败时 bash 工具收到结构化错误（模式 + "Runner failure" + 日志路径），诊断闭环符合设计。
 
+### M3-M4 补充实测（2026-11-14 晚，headless 激活级 + 直调）
+
+- **关键修复：stderr 分离（exec2 帧协议）**。M0 合并流（stdout+stderr 单管道）下官方拒绝分类
+  `matchesSignature(exitCode, result.stderr.text, sigs)` 只查 stderr → EROFS 永远 `denied:false`，
+  官方拒绝标记与升级提示不出现（此前 M1 的"EROFS 拒绝方言命中"只验了输出含错误文本，未验 denied 事实——
+  滚动 TODO 保留该项是对的）。修复：agent 新增 `{"type":"exec2"}`——先回头行
+  `{"ok":true,"stderr":"split"}`，随后帧流 `[tag u8][len u32 LE][payload]`（tag 1=stdout、2=stderr、
+  3=退出码），两 relay 线程经互斥整帧写入（scoped threads 借用本地锁，waitpid 与排空并行防管道互锁）；
+  `krun-backend exec` 发送 exec2 并解帧，流首无头行则按旧合并协议处理（旧镜像 agent 自动回退，零部署断层）。
+- **EROFS → 拒绝闭环实测（read-only headless 会话）**：`touch ./should-be-denied.txt` → stderr
+  `Read-only file system` → 工具输出追加官方 `[sandbox: file access denied under read-only mode]` +
+  升级提示；`--approval-policy never` 下模型如实报告且不升级。**GUI 会话内批准升级 → 路由切 rw VM**
+  的最后一步仍需用户配合验证（headless 无法模拟交互审批）。stdout/stderr/退出码分离回归：
+  `echo stdout && echo stderr >&2 && exit 3` 三者如实分离上报。
+- **空闲回收实测（idleStopMs=40s + GC 间隔 60s）**：三段 bash 调用——①写 `/opt/idle-marker`；②
+  `sleep 75`（期间 GC tick 到期，idle>40s）；③读回。②未被误杀 = **agent stat 活跃连接保护生效**
+  （execConns=1 → 跳过回收并刷新计时）；boot 日志 2 行 = ①②后空闲回收、③重新引导；③读回内容不变 =
+  数据层跨回收保留。前置修复：`confine()` 原不刷新 `lastUse`（exec 路径会话会被 GC 误杀）→ confine 时刷新。
+- **run_in_background 跨调用存活实测**：`run_in_background` 启动 `sleep 40 && echo BG-DONE >> /opt/bg-result`，
+  前台两调用后 VM 退出，`debugfs` 读数据层盘 `/upper/opt/bg-result` = `BG-DONE`（boot 日志单行 = 会话
+  全程未回收）。VM 内长驻子进程跨 bash 调用存活 ✓。
+- **agent stat 协议**：`{"type":"stat"}` → `{"ok":true,"execConns":N,"termConns":M}`（AtomicUsize 计数），
+  GC 据此实现设计 §7 的"无活动连接"语义（run_in_background 长驻连接免回收）；旧 agent 无此消息 → stat
+  超时回退 liveTerminals 判定。
+- **cwd 修正**：`confine()` 不再传 `--cwd process.cwd()`（harness 进程 cwd ≠ 会话 cwd 时 guest 内 cwd 错位）；
+  executor 以每次调用的 workdir spawn exec 客户端（LocalBashExecutor `cwd: spec.workdir`），客户端
+  `getcwd()` 兜底，工作区同路径挂载下零映射。实测 headless 内 `pwd` = 绑定工作区路径。
+- **/vm 命令组（M3）**：`commands.register` 全局注册单命令 `/vm`（rawInput 解析
+  `status | stop [all|<key>|ro|rw] | reset confirm`），disposer 挂本插件 fiber（HMR 反注册）；
+  headless 激活 diag 全链（"commands inject callback fired" → "registered /vm"）。处理器直测：
+  status 汇总镜像/绑定/会话/当前工作区；stop 无匹配报错；reset 两段式（无 confirm 只出计划——
+  破坏类操作 user-only，confirm 后停会话 + 删数据层并回报）。
+- **镜像管理 E2E（M4 v1）**：数据布局 `<dataDir>/images/<id>/{manifest.json, rootfs}` +
+  `registry.json`（工作区绑定，tmp+rename 原子写）。导入核心 `runImportJob` 为纯函数（不经 cordis，
+  可直调测试）。来源 v1：URL / 本地 tarball / 目录树 / 容器导出（docker|podman export tar 流落盘再解包）。
+  Alpine 导入自动免 root 装 bash（M1 loader 技巧；**判定以 bash 二进制落地为准**——apk 对 chroot
+  trigger 报 EPERM 可忽略，首版误把 apk 退出码当致命，已修）。E2E：minirootfs 3.22 URL 导入
+  （12.9MiB，bashReady=true）→ 绑定测试工作区 → overlay `imageRootfs: ""` 强制走绑定 → headless
+  引导 → `/etc/alpine-release=3.22.0` + `bash 5.2.37` ✓（boot 日志 rootfs=导入镜像路径）。
+- **镜像/绑定 API 与管理页**：`GET /api/krun/images`、`POST /api/krun/images/import|delete`、
+  `POST /api/krun/workspaces/bind|unbind|reset`；status 快照扩展 images/workspaces/jobs/idleMs。
+  管理页新增"镜像"卡（列表/导入表单/删除，引用计数禁删）与"工作区绑定"卡（绑定/解绑/重置数据层），
+  导入任务运行中 3s 轮询。删除保护：有绑定或运行中会话引用时拒绝。
+- **probe 语义更新**：镜像可用性 = 配置 imageRootfs（遗留单镜像路径，保持兼容）或已导入镜像任一；
+  boot 时镜像解析顺序 = registry 工作区绑定 → imageRootfs，无镜像 fail-closed。
+
 ### M2 实测记录（2026-11-14 下午，手动 backend 会话 + harness 集成）
 
 - **数据层持久化 ✓**：完整"写入 → 停机 → 重启 → 读回"闭环（/opt/persist-marker-krunval 跨 4 个 VM 会话存活，且覆盖一次 dsh 进程重启）；同一 (workspace, mode) key 复用同一 ext4 数据盘，符合设计。
@@ -506,24 +556,28 @@ class KrunVmService extends Service {
 - [x] fail-closed（boot 失败 → 结构化 Runner failure）
 - [x] ro 会话 EROFS 拒绝方言命中 denialSignatures
 - [x] web app 激活稳定复核（diag.log 全链：constructor → webServer inject fired → 3 条路由 registered；管理页经用户确认已出数据）
-- [ ] EROFS → 升级 UX 端到端：模型在 read-only 会话触发拒绝标记 → `sandbox_permissions` 升级 → 路由切到 rw VM（需 GUI 会话配合：把会话切到 read-only 跑写命令，观察拒绝标记与升级）
+- [x] EROFS 拒绝标记与升级提示闭环（stderr 分离修复后 headless 实测：官方 `[sandbox: file access denied under read-only mode]` + 升级提示出现，模型如实上报；**GUI 会话内批准升级 → 路由切 rw VM 待用户配合验证**）
 
 **M2 持久化与终端**
 
 - [x] rw 数据层跨 VM 重启持久化（4 会话闭环）
 - [x] ro/rw 双会话并存
-- [x] 空闲回收机制代码就位（`ctx.interval` fiber effect；terminals 占用跳过）→ 待实测一轮：idleStopMs 到期后会话消失、下次调用重新引导、数据层保留
+- [x] 空闲回收实测（idleStopMs=40s：GC 不误杀活跃 exec（agent stat 保护）、空闲后回收重引导、数据层跨回收保留；前置修复 confine 刷新 lastUse）
 - [ ] Web 终端开在 VM 内——**已可用的路径 = agent 工具**：新会话里让 agent 调 `terminal_open {"type":"krun"}`（三预设覆写已验证：standard/ptc/minimal 均含注册器）。**侧栏"新建终端"走的是另一套 shell 选择器系统（dsh-api-terminal-controller），不经 backend 注册表，永远不会有 krun 选项**——见附录 C 坑 8；侧栏级 VM 终端列 M4 候选。PTY 80x24 固定，resize 列为后续
-- [ ] `run_in_background` 任务跨调用存活（VM 内长驻进程 + 连接保持语义已确认，待真实 bash 工具一轮）
+- [x] `run_in_background` 任务跨调用存活（VM 内长驻子进程写入数据层，debugfs 读回验证；会话全程未回收）
 
 **M3 管理界面**
 
 - [x] `/api/krun/status|stop|probe` 路由注册（401 前置 = 路由已挂）
-- [ ] 浏览器实测：Settings → "VM sandbox" 页（环境体检/会话列表/停止）、`conversation.input.left` 状态芯片（VM ×N）
-- [ ] `/vm` 命令组未实现（commands.register，v1 可选项）
+- [x] `/vm` 命令组（commands.register 全局单命令：status/stop/reset confirm；headless 激活 diag + 处理器直测）
+- [x] 镜像/工作区绑定 API（images、images/import、images/delete、workspaces/bind|unbind|reset；导入任务 409 串行）
+- [ ] 浏览器实测：Settings → "VM sandbox" 页（环境体检/会话/镜像/绑定四卡 + 状态芯片）——路由与数据通道已就绪，需用户在 GUI 复核渲染
+- [ ] `/vm` 命令的 composer 侧发现性实测（注册已验证，UI 补全/执行待用户）
 
-**M4 打磨（未开始）**
-- [ ] 镜像管理（KrunVmService 导入/注册表/绑定；当前 imageRootfs 单镜像直配）
+**M4 打磨**
+
+- [x] 镜像管理 v1（URL/tarball/dir/容器导出导入 + manifest + registry.json 绑定 + 删除保护 + Alpine 自动装 bash；导入 E2E：minirootfs 3.22 → 绑定 → 引导 ✓）
+- [ ] 镜像预设清单（管理页内置 2-3 个经测试的 URL 条目）
 - [ ] `network: tsi` + 应用层端口代理（"只暴露指定端口"组合）
 - [ ] qcow2、aarch64、诊断 skill、README
 
@@ -533,6 +587,9 @@ class KrunVmService extends Service {
 - [x] terminals.registerBackend fiber 绑定（DUPLICATE_BACKEND，见附录 C 第 4 条坑）
 - [x] 管理页 404 根因修复（坑 5/6：inject 回调签名 + 类方法 ctx 越界引用；diag.log 全链验证）
 - [x] backend usage 字符串补全（`--setup/--ws-path/--data-img/--network`）
+- [x] **stderr 分离（exec2 帧协议）**：合并流使官方拒绝分类（只查 stderr）永远 denied=false，拒绝标记/升级 UX 失效——本日实测发现并修复
+- [x] **confine 刷新 lastUse**：exec 路径会话此前不计时，会被空闲 GC 误杀
+- [x] **cwd 兜底**：confine 不再传 harness 进程 cwd，executor spawn cwd 经 exec 客户端 getcwd() 透传
 - [ ] 移除 provider 的 krunDiag 诊断标记（当前保留为排障手段，稳定一轮后清理）
 - [ ] `serve` 子命令与设计 §4.1 的守护进程形态未接线（当前 provider 直 spawn `boot`，一 VM 一进程，守护进程层暂缺——设计偏差，待 M4 决策收敛）
 - [ ] `krun_get_max_vcpus` 探测在内建沙盒下返回 -1（probe 需 /dev/kvm 可达；provider probe 已正确 fail-closed）
