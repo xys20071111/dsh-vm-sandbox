@@ -1,0 +1,4 @@
+[submodule "backend/vendor/libkrun"]
+	path = backend/vendor/libkrun
+	url = https://github.com/containers/libkrun
+	branch = stable-1.19.x

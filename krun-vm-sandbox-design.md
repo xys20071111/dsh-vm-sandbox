@@ -295,7 +295,8 @@ class KrunVmService extends Service {
   index.js              # KrunVmService（含 SandboxProvider + TerminalBackend 注册；守护进程 socket 客户端）
   bin/krun-backend      # Rust 守护进程 + exec 客户端（backend/ 构建产物：serve/exec/probe 子命令）
   backend/              # Rust 工作区源码：守护进程、api 包装、guest agent、guest setup
-  backend/vendor/libkrun/   # vendor 锁定 stable-1.19.x（path 依赖，可打补丁）
+  backend/vendor/libkrun/   # git submodule：containers/libkrun stable-1.19.x，锁定 1.19.8
+                            # （发布点 c4d283c2）；path 依赖 src/libkrun；更新 = update --remote + 重锁 + 重建
   guest/{dsh-setup,dsh-vm-agent}-{x86_64,aarch64}   # 静态编排器 + agent（musl）
   client.js             # 管理页 + 状态芯片（dsh.client 懒注册）
   locale/{zh,en}.json
