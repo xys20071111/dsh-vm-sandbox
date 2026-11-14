@@ -1,0 +1,21 @@
+# krun VM sandbox overlay —— 供 `dsh --patch` 注入（dump-config 校验 / headless 试验）。
+# 与 ~/.dsh/profiles/web/cordis.patch.yml 的 krun 段保持一致。
+# Web 终端注册器（terminal-backend.js）需经 agent-preset 编辑器加入 persistent-shell
+# 组后才会生效（terminals 服务每组 isolate；见设计文档附录 C 坑 6）。
+- id: sandbox
+  disabled: true
+- insert:
+    - id: sandbox-vm
+      name: '@local/dsh-krun-vm'
+      config:
+        enabled: true
+        imageRootfs: /home/xys/opt/krun-m0/images/alpine/rootfs
+        libDir: /home/xys/opt/libkrun/lib
+        bootTimeoutMs: 20000
+        idleStopMs: 600000
+        network: none
+        portMap: []
+        resources:
+          vcpus: 2
+          ramMib: 2048
+

@@ -1,0 +1,18 @@
+# 激活级冒烟 overlay：绝对路径加载插件（headless profile 无 @local 链接）。
+# peer deps（@deepseek-ai/dsh-sandbox 等）由 cordis-plugin-loader 映射到宿主包。
+- id: sandbox
+  disabled: true
+- insert:
+    - id: sandbox-vm
+      name: /home/xys/workspace/VibeCoding/sandbox/plugin/index.js
+      config:
+        enabled: true
+        imageRootfs: /home/xys/opt/krun-m0/images/alpine/rootfs
+        libDir: /home/xys/opt/libkrun/lib
+        bootTimeoutMs: 20000
+        idleStopMs: 600000
+        network: none
+        portMap: []
+        resources:
+          vcpus: 2
+          ramMib: 2048
