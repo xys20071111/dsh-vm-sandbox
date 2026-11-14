@@ -1,0 +1,13 @@
+# 构建产物（由 scripts/build.sh 从 backend/ 源码构建部署）
+backend/target/
+plugin/bin/krun-backend
+plugin/guest/dsh-vm-agent-x86_64
+
+# 依赖
+node_modules/
+
+# 运行期本地状态
+*.log
+
+# 工具本地状态
+.commandcode/
