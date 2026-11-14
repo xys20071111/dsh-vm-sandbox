@@ -1,0 +1,10 @@
+[package]
+name = "dsh-vm-agent"
+version = "0.1.0"
+edition = "2021"
+description = "Guest-side agent for the DSH krun sandbox: vsock listener bridging exec and PTY sessions"
+
+[dependencies]
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

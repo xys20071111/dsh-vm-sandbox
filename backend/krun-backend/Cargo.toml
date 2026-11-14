@@ -1,0 +1,12 @@
+[package]
+name = "krun-backend"
+version = "0.1.0"
+edition = "2021"
+description = "DSH krun VM sandbox backend: daemon exposing libkrun over a UNIX socket"
+
+[dependencies]
+# libkrun 直接作为依赖（进程内调用其 pub extern "C" API，无 dlopen / 无手写绑定）。
+# vendor 锁定 stable-1.19.x；libkrunfw.so.5 仍是唯一运行时外部库（libkrun 自行 dlopen）。
+libkrun = { path = "../vendor/libkrun/src/libkrun", default-features = false, features = ["init-blob", "blk", "net"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

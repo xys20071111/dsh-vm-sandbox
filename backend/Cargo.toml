@@ -1,0 +1,6 @@
+[workspace]
+resolver = "2"
+members = ["krun-backend", "guest/dsh-vm-agent"]
+
+[profile.release]
+strip = true
