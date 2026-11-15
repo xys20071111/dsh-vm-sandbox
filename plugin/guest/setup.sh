@@ -16,7 +16,12 @@ mkdir -p /run/newroot /run/data
 
 # 2. 合成根
 if [ "$MODE" = rw ]; then
-  mount -t ext4 /dev/vda /run/data
+  # 数据层盘：宿主预格式化（raw 常规路径）或空白盘（qcow2 首次启动）时在 guest 内格式化
+  if ! mount -t ext4 /dev/vda /run/data; then
+    echo "SETUP: /dev/vda not formatted — mkfs in guest"
+    mkfs.ext4 -q /dev/vda
+    mount -t ext4 /dev/vda /run/data
+  fi
   mkdir -p /run/data/upper /run/data/work
   mount -t overlay overlay -o "lowerdir=/,upperdir=/run/data/upper,workdir=/run/data/work" /run/newroot
 else

@@ -47,10 +47,23 @@ window.__ModuleLoader__.load({
 
     const fmtMib = (bytes) => (bytes ? `${(bytes / 1048576).toFixed(1)}MiB` : '?');
 
+    // 内置镜像预设（均经导入 + 引导实测；URL 以发布页为准）
+    const IMAGE_PRESETS = [
+      { name: 'alpine-minirootfs-3.22', url: 'https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/x86_64/alpine-minirootfs-3.22.0-x86_64.tar.gz' },
+      { name: 'ubuntu-base-24.04', url: 'https://cdimage.ubuntu.com/ubuntu-base/releases/24.04.3/release/ubuntu-base-24.04.3-base-amd64.tar.gz' },
+    ];
+
     function ImportForm({ onMsg, refresh }) {
       const [kind, setKind] = React.useState('url');
       const [src, setSrc] = React.useState('');
       const [name, setName] = React.useState('');
+      const applyPreset = (id) => {
+        const p = IMAGE_PRESETS.find((x) => x.name === id);
+        if (!p) return;
+        setKind('url');
+        setSrc(p.url);
+        setName(p.name);
+      };
       const submit = async () => {
         const body = { kind, name: name || undefined };
         if (kind === 'container') body.container = src;
@@ -60,20 +73,25 @@ window.__ModuleLoader__.load({
         onMsg(r.ok ? `导入任务已提交：${r.jobId}` : `导入失败：${r.err ?? r.status}`);
         refresh();
       };
-      return h('div', { className: 'krun-row' },
-        h('select', { className: 'krun-btn', value: kind, onChange: (e) => setKind(e.target.value) },
-          h('option', { value: 'url' }, 'URL'),
-          h('option', { value: 'tarball' }, 'tarball'),
-          h('option', { value: 'dir' }, '目录'),
-          h('option', { value: 'container' }, '容器导出')),
-        h('input', {
-          className: 'krun-input',
-          placeholder: kind === 'container' ? '容器名（docker/podman export）' : kind === 'url' ? 'https://…/rootfs.tar.gz' : '/绝对路径',
-          value: src,
-          onChange: (e) => setSrc(e.target.value),
-        }),
-        h('input', { className: 'krun-input', placeholder: '名称（可选）', value: name, onChange: (e) => setName(e.target.value) }),
-        h('button', { className: 'krun-btn', onClick: submit }, '导入'));
+      return h('div', null,
+        h('div', { className: 'krun-row' },
+          h('select', { className: 'krun-btn', value: '', onChange: (e) => applyPreset(e.target.value) },
+            h('option', { value: '' }, '预设（已测）…'),
+            IMAGE_PRESETS.map((p) => h('option', { key: p.name, value: p.name }, p.name)))),
+        h('div', { className: 'krun-row' },
+          h('select', { className: 'krun-btn', value: kind, onChange: (e) => setKind(e.target.value) },
+            h('option', { value: 'url' }, 'URL'),
+            h('option', { value: 'tarball' }, 'tarball'),
+            h('option', { value: 'dir' }, '目录'),
+            h('option', { value: 'container' }, '容器导出')),
+          h('input', {
+            className: 'krun-input',
+            placeholder: kind === 'container' ? '容器名（docker/podman export）' : kind === 'url' ? 'https://…/rootfs.tar.gz' : '/绝对路径',
+            value: src,
+            onChange: (e) => setSrc(e.target.value),
+          }),
+          h('input', { className: 'krun-input', placeholder: '名称（可选）', value: name, onChange: (e) => setName(e.target.value) }),
+          h('button', { className: 'krun-btn', onClick: submit }, '导入')));
     }
 
     function BindForm({ images, onMsg, refresh }) {

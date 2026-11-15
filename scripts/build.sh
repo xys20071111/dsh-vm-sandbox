@@ -22,6 +22,21 @@ cargo build --release -p krun-backend
 echo "== build dsh-vm-agent (musl static-pie)"
 cargo build --release --target x86_64-unknown-linux-musl -p dsh-vm-agent
 
+# aarch64 guest agent（best-effort：rust-lld 自包含链接，无需外部 musl 交叉 gcc）。
+# 仅产出二进制供 aarch64 主机部署；aarch64 VM 引导需 aarch64 libkrunfw + rootfs，
+# x86_64 主机不可实测（M4 待办，见设计文档）。
+if rustup target list --installed | grep -q '^aarch64-unknown-linux-musl$'; then
+  if RUSTFLAGS="-C linker=rust-lld" cargo build --release --target aarch64-unknown-linux-musl -p dsh-vm-agent; then
+    install -D -m 0755 target/aarch64-unknown-linux-musl/release/dsh-vm-agent \
+      "../plugin/guest/dsh-vm-agent-aarch64"
+    echo "== deployed: plugin/guest/dsh-vm-agent-aarch64（aarch64 预置，未实测）"
+  else
+    echo "== skip: aarch64 agent build failed（不影响 x86_64）" >&2
+  fi
+else
+  echo "== skip: aarch64-unknown-linux-musl target 未安装（rustup target add 后自动产出）"
+fi
+
 install -D -m 0755 target/release/krun-backend ../plugin/bin/krun-backend
 install -D -m 0755 target/x86_64-unknown-linux-musl/release/dsh-vm-agent \
   "../plugin/guest/dsh-vm-agent-x86_64"

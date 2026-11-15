@@ -163,10 +163,11 @@ krun_start_enter(ctx);                      // 阻塞至 VM 关闭
 
 | 配置 | 实现 | 适用 |
 |---|---|---|
-| `tsi`（默认） | 不添加任何 net 设备 → libkrun 自动启用 TSI（guest socket 系统调用经 virtio-vsock 伪装，共享宿主网络） | 开箱即用；注意 **1.19.x 的 `krun_set_port_map` 是改名映射而非白名单**：map 未命中的 guest 端口仍按原端口绑宿主，即 guest 任意监听都会占用宿主同号端口。"只暴露指定端口"需 `none` 档 + 应用层代理 |
+| `tsi`（默认） | 不添加任何 net 设备 → libkrun 自动启用 TSI（guest socket 系统调用经 virtio-vsock 伪装，共享宿主网络） | 开箱即用；注意 **1.19.x 的 `krun_set_port_map` 是改名映射而非白名单**：map 未命中的 guest 端口仍按原端口绑宿主，即 guest 任意监听都会占用宿主同号端口。"只暴露指定端口"用 `none` 档 + `portMap` 转发（下行） |
 | `none` | `krun_disable_implicit_vsock()` + `krun_add_vsock(0)`（保留 vsock 但关闭 TSI 劫持） | 严格隔离；控制通道不受影响 |
+| `portMap`（任意档位叠加） | **应用层端口转发（2026-11-15 实现，替代 1.19.x 改名映射）**：每条 `host:guest` 配一个额外 vsock 端口（4200 起），VMM 桥接 `run/<key>.fwd<vsock>.sock`，agent（`DSH_FORWARD_PORTS`）中继到 guest `127.0.0.1:<guest>`；provider 在宿主监听 `127.0.0.1:<host>` → 该 socket。`none` 档下即"零宿主端口占用 + 只暴露指定端口"组合；转发连接计入 stat `fwdConns`（免于空闲回收） | 显式白名单式暴露 |
 
-安全注记：libkrun 官方安全模型明确"VM 边界不限制通过设备暴露的宿主资源"，TSI 使用 VMM 的宿主网络权限——因此 `network: 'none'` 是唯一网络级隔离档位，文档必须如实说明（文件效果词汇不覆盖网络，这与 DSH 沙盒模式语义一致）。
+安全注记：libkrun 官方安全模型明确"VM 边界不限制通过设备暴露的宿主资源"，TSI 使用 VMM 的宿主网络权限——因此 `network: 'none'` 是唯一网络级隔离档位（`portMap` 转发是显式开的孔），文档必须如实说明（文件效果词汇不覆盖网络，这与 DSH 沙盒模式语义一致）。
 
 ### 4.4 运行时依赖与安装
 
@@ -395,9 +396,9 @@ class KrunVmService extends Service {
 |---|---|---|
 | M0 可行性尖峰 | ✅ | libkrun 用户前缀引导、直接依赖、argv 约定、guest 编排、vsock 回环全通（附录 C 前段） |
 | M1 核心接缝 | ✅ | confined bash 落 VM、fail-closed、EROFS 拒绝方言、dump-config 行覆盖、E2E（15:37 与当日复验）；**stderr 分离修复后拒绝标记/升级提示闭环**（23:0x 复测；GUI 批准升级步待用户） |
-| M2 持久化与终端 | ✅ | 持久化/双会话/网络档位 ✅；空闲回收实测 ✅（stat 活跃连接保护 + 数据层跨回收保留）；run_in_background 跨调用 ✅；Web 终端注册器就绪待实测（坑 7/8） |
-| M3 管理界面 | ▲ | settings.section 页 + 状态芯片 + `/api/krun/*` 路由 ✅；`/vm` 命令组 ✅（headless 激活 + 处理器直测）；浏览器实测待用户复核 |
-| M4 打磨 | ▲ | 镜像管理 v1 ✅（URL/tarball/dir/容器导入 + 注册表绑定 + 管理页两卡 + E2E）；qcow2、aarch64、诊断 skill、README 之外的文档化待做 |
+| M2 持久化与终端 | ✅ | 持久化/双会话/网络档位 ✅；空闲回收实测 ✅（stat 活跃连接保护 + 数据层跨回收保留）；run_in_background 跨调用 ✅；Web 终端注册器就绪待实测（坑 7/8）；**侧栏终端已适配**（shellCandidates + 桥 + resize，实测通过） |
+| M3 管理界面 | ▲ | settings.section 页 + 状态芯片 + `/api/krun/*` 路由 ✅；`/vm` 命令组 ✅（**用户 GUI 确认通过**）；镜像/绑定四卡 + 预设清单 ✅；数据通道经用户 GUI 确认 |
+| M4 打磨 | ▲ | 镜像管理 v1 + 预设清单 ✅（alpine/ubuntu 全流程实测）；**端口转发（none 档白名单组合）** ✅；**qcow2 数据层** ✅；**侧栏终端** ✅；**诊断 skill** ✅；aarch64 agent 预置（构建实测、VM 引导待 aarch64 主机）；serve 守护进程形态待决策 |
 
 ### 15.2 运行形态（当前 live 配置）
 
@@ -412,21 +413,22 @@ class KrunVmService extends Service {
 
 ### 15.3 已验证能力（证据见附录 C）
 
-持久化跨 VM/跨 dsh 重启；ro EROFS 拒绝（命中 denialSignatures，官方拒绝标记/升级提示闭环）；
-ro/rw 双会话并存；`--network tsi|none` 双档（出站 TCP+DNS / 零端口占用）；TSI 入站自动端口暴露全链路；
-`exec --env` 到达 guest；管理页路由三联注册；三预设覆写组合（standard/ptc/minimal）；
-空闲回收（stat 活跃连接保护 + 数据层跨回收保留）；run_in_background 跨调用存活；
-`/vm` 命令组；镜像导入→绑定→引导 E2E（Alpine 3.22 minirootfs）。
+持久化跨 VM/跨 dsh 重启；ro EROFS 拒绝（官方拒绝标记/升级提示闭环）；ro/rw 双会话并存；
+`--network tsi|none` 双档；TSI 入站自动端口暴露全链路；`exec --env` 到达 guest；管理页路由
+三联注册；三预设覆写组合；空闲回收（stat 活跃连接保护 + 数据层跨回收保留）；run_in_background
+跨调用存活；`/vm` 命令组；镜像导入→绑定→引导 E2E（alpine/ubuntu 双预设）；端口转发往返；
+qcow2 数据层（guest 内首启格式化 + 持久化）；侧栏终端桥（附加/执行/resize）；aarch64 agent 构建。
 
 ### 15.4 已知限制与偏差（如实）
 
-- `port_map` 在 1.19.x 是**改名映射而非白名单**（tsi 档下 guest 任意监听自动占宿主同号端口）
-- PTY 固定 80x24，无 resize 协议（agent v1）
-- GUI 侧栏"新建终端"是 shell 选择器系统，不经 backend 注册表（坑 8）；krun 终端入口 = `terminal_open {"type":"krun"}`
+- `port_map` 的 1.19.x 改名映射语义仅 backend CLI 保留；provider `portMap` 配置现为 vsock 应用层转发（宿主绑 127.0.0.1，转发连接计入活跃）
+- agent resize 经内联 OSC 7777（仅桥与 agent 同代时生效；用户粘贴含该序列的数据会被吞——极小概率，如实记录）
+- PTY resize 链路：侧栏桥/agent 工具路径均已支持；GUI 侧栏 shell 选择器里 krun 项经用户补丁层 `shellCandidates` 接线（dsh 更新后需复核默认候选列表）
 - `serve` 守护进程形态未接线（provider 直 spawn boot）
 - cordis 预设（创造模式）按用户要求未接入终端组
 - busybox 测试坑：nc 遇 stdin EOF 即退（`punt!`）、无 httpd applet——均非沙盒问题
 - exec2 帧协议为 v2 增量：旧镜像内 agent 走合并流回退（stderr 不分离 → 拒绝分类失效），boot 时 bakeGuestFiles 自动烤入新 agent，滚动更新自愈
+- aarch64：agent 静态二进制已预置，VM 引导链（aarch64 libkrunfw/rootfs）未实测
 
 ### 15.5 排障手段
 
@@ -531,7 +533,49 @@ ro/rw 双会话并存；`--network tsi|none` 双档（出站 TCP+DNS / 零端口
   显式 `config.dataDir` 仍优先且不触发迁移。首次激活自动迁移：同盘 rename 原子，跨设备 EXDEV
   退回复制 + 删除；目标已存在则保留 legacy 不合并（不重试不破坏）。假 `$HOME` 沙箱实测：
   迁移（EXDEV 复制回退 + 内容完好）与新默认目录内真实引导会话（uname/exec/workspaces img/
-  boot log 全落新目录）均通过。真实迁移在下次 live 重启激活时发生。
+  boot log 全落新目录）均通过。live 重启实测迁移完成，绑定/镜像/数据盘完好（管理页与 `/vm`
+  经用户确认通过）。
+
+### M4 打磨实测（2026-11-15）
+
+- **侧栏终端适配（坑 8 收口）**：调研确认 `dsh-api-terminal-controller` 的接缝 = `shellCandidates`
+  配置（node-pty 以会话工作目录 spawn，`resolveExecutable` 验证候选）。适配三件套：
+  ① agent term 协议升级——请求带 `cols/rows` 初始尺寸，输入中继扫描宿主桥内联的
+  OSC 7777 resize 序列（`ESC ] 7777;resize;C;R BEL`）应用 `TIOCSWINSZ`（内核自动派发
+  SIGWINCH），序列不落盘；② 侧栏桥 `plugin/bin/krun`（node 脚本，cwd → (workspace,rw)
+  会话键 → agent.sock，stdin/stdout 双向中继 + SIGWINCH 转发 + EXIT 行剥离退出码；
+  会话未运行时经新增的 `POST /api/krun/ensure` 引导）；③ 用户补丁层浅覆写
+  `terminal-controller` 的 `shellCandidates`（默认六项 + 桥绝对路径）。实测：桥接附加、
+  命令执行、resize（stty size 30 100 → OSC 110x33 → 40 120）全部正确。
+- **关键修复：agent fd 卫生（CLOEXEC）**。accept/dup/pipe 均未设 CLOEXEC → fork 出的后台
+  存活子进程（如 nohup 循环）替已结束的 exec 会话握住 vsock 连接 fd → 宿主 exec 客户端
+  read_to_end 永不 EOF，**命令挂死**（guest ps 证实外层 sh 已退、仅后台循环存活）。
+  修复 = `dup_cloexec`/`accept4(SOCK_CLOEXEC)`/`pipe2(O_CLOEXEC)` 全量替换（dup2 定向
+  0/1/2 的语义路径保留）。复测：nohup 后台命令立即返回、转发连接正常收发。
+- **应用层端口转发（`network: tsi + 只暴露指定端口` 收口）**：`portMap` 语义改为 vsock
+  应用层转发（§4.3 已更新）：backend `--forward host:guest`（vsock 4200 起 +
+  `run/<key>.fwd<vsock>.sock`）+ agent 启动参数 `DSH_FORWARD_PORTS` 中继 guest
+  `127.0.0.1:<guest>` + provider 宿主监听 `127.0.0.1:<host>`；none 档下即零占用白名单组合。
+  实测：宿主 `127.0.0.1:18080` → guest nc 应答往返 ✓；会话停机自动关监听 ✓；
+  stat 增 `fwdConns`（转发连接免空闲回收）。
+- **qcow2 数据层**：`dataDiskFormat: 'qcow2'`（backend `--data-format`，qemu-img 建空白盘；
+  首次启动 guest 内 `mkfs.ext4 /dev/vda`——setup.sh 挂载失败即格式化）。Alpine 镜像缺
+  e2fsprogs → `ensureGuestPackages` 免 root loader-apk 幂等补装（宿主网络；boot 时按需 +
+  导入时均可）。实测：qcow2 引导、guest 内格式化、/opt 写入持久化、盘文件 8.6MB（对 8.5G
+  raw 稀疏）✓。连带修复：**waitForAgent 改 ping/pong**——VMM 桥接 socket 在 guest agent
+  就绪前即可连（mkfs 期间 exec 会 ConnectionReset），以 `{"type":"ping"}` 应答为就绪判据。
+- **镜像预设清单**：管理页导入表单内置两个**已实测**预设（alpine-minirootfs 3.22、
+  ubuntu-base 24.04.3——后者全流程实测：导入 → 绑定 → 引导出 Ubuntu 24.04.3 LTS +
+  bash 5.2.21）。
+- **aarch64 预置（未实测）**：agent 以 `RUSTFLAGS="-C linker=rust-lld"` 自包含链接
+  aarch64-unknown-linux-musl 成功（静态，无外部 musl 交叉 gcc 依赖）；build.sh best-effort
+  产出 `plugin/guest/dsh-vm-agent-aarch64`；provider bake 按宿主架构选择。aarch64 VM 引导
+  需 aarch64 libkrunfw + rootfs（x86_64 主机不可实测，待 aarch64 主机）。
+- **诊断 skill**：`diagnose-krun-vm-sandbox` 以 `ctx.skills.register` 内联注册（根作用域 =
+  全局；`skills` 注册表根作用域可用——web-app 只禁了 filesystem provider 与 tool-skill）。
+  内容：结构化错误 → probe → boot log（会话键公式 + 常见结尾表）→ dump-config → headless
+  冒烟 → 意图核对（空闲回收/网络档/侧栏接缝）→ 破坏类操作 user-only。headless diag
+  全链验证（`registered diagnose-krun-vm-sandbox`）+ 限制命令回归通过。
 
 ### M2 实测记录（2026-11-14 下午，手动 backend 会话 + harness 集成）
 
@@ -551,7 +595,7 @@ ro/rw 双会话并存；`--network tsi|none` 双档（出站 TCP+DNS / 零端口
   5. **`ctx.inject(deps, cb)` 的 cb 收到 `(子ctx, config)`，服务经子ctx 属性访问**（源码 `runtime.callback(this.ctx, config)`；官方写法对照 open-in-app 的 `export const inject = [...]` + `ctx.webServer.register(...)`）。把首参当服务用（`(webServer) => webServer.register(...)`）实际是 `childCtx.register` → 抛错 → 子 plugin fiber 独立失败：**路由/终端后端静默缺失，而 sandbox 主服务照常工作**（bash 正常但管理页 API 全 404 的根因）。修复 = `(injectCtx) => injectCtx.webServer.register(...)`。
   6. **类方法里引用构造函数参数 `ctx` = ReferenceError**：krunRegisterRoutes 里的 `ctx.effect` 越界引用被 try/catch 吞掉后子 fiber 静默失败（管理页 404 的最终根因）——修复 = 构造时保存 `this.krunCtx`。**文件诊断标记法**（provider 向 `~/.dsh-krun/diag.log` 追加带时间戳的激活/注册轨迹）一次定位了"回调没跑 vs 跑了抛错 vs 注册了被摘除"三类假设，推荐保留为激活期排障手段。
   7. **terminals 服务不可在根作用域注册**：web-app preset 把 `@deepseek-ai/dsh-terminal` 放在 `persistent-shell`（cordis:group, `isolate: { terminals: true }`）组内——**每 agent 会话独立实例**，根作用域 `inject(['terminals'])` 永远 pending。该组嵌在 agent-preset 的 `config.plugins` 数据里：**补丁层 group-insert（`- id: <group>, insert: [...]`）够不到**（boot patch 解析只走全局树，报 entry not found），内置预设 Web 编辑器也不可编辑。可行路径 = **用户层覆写 preset 行的 config**（patch 对非 insert 条目按键浅覆写 `target[key] = value`；AgentPreset schema 要求 id+plugins 必填 → 必须带完整 config）。**预设构成事实**：四个内置预设中仅 `preset-minimal` 自带终端组（persistent-shell: pty/terminal-bash/persistent-bash/terminal-pwsh/persistent-pwsh），standard/ptc/cordis 均无 terminals 服务。按用户要求最终覆盖 = minimal（组尾追加注册器）+ standard/ptc（**注入精简终端组**：pty + terminal-bash + 注册器；不带 persistent-bash/pwsh 避免与既有 tool-bash 重复）+ cordis（创造模式）不动。生成已脚本化：取 `dsh-web-app/presets/*.patch.yml` 的 config 块（第 7 行起）左移 4 列（harness/krun-preset-override.yml，**dsh 更新 preset 后需重新生成**）。组内注册器 = 插件子路径导出 `@local/dsh-krun-vm/terminal-backend`（inject ['terminals','sandbox']，fiber 绑定清理）；terminals 不可 isolate 继承，workingDirectory/sandbox 等其他服务均根作用域可见。
-  8. **DSH 有两套互不相通的终端系统**（修正 §2"注册 TerminalBackend 即得 Web 终端标签"的设想）：① **GUI 侧栏"新建终端"** = `dsh-api-terminal-controller` 的 shell 选择器路径（`subprocess.spawnTerminal` 按 shellPath 枚举宿主 shell），**完全不经过 terminals 服务的 backend 注册表**——侧栏里永远不会出现 krun 选项，宿主 shell 是该表面的既定行为；② **agent 的 `terminal_*` 工具**（dsh-tool-terminal：terminal_open/send/read/signal/kill/list）= terminals 服务的真正消费者，`terminal_open` 的 `type` 是**自由字符串参数**（`args.type.length === 0` 校验后直传 spawn 请求）。krun 终端的用户路径 = 在会话里让 agent 调 `terminal_open {"type":"krun"}`（自然语言"开一个 krun 终端"即可映射）。侧栏级 VM 终端（shell 选择器里出现 krun）需宿主侧 PTY 桥接脚本或改 controller，列为 M4 候选。
+  8. **DSH 有两套互不相通的终端系统**（修正 §2"注册 TerminalBackend 即得 Web 终端标签"的设想）：① **GUI 侧栏"新建终端"** = `dsh-api-terminal-controller` 的 shell 选择器路径（`subprocess.spawnTerminal` 按 shellPath 枚举宿主 shell），**完全不经过 terminals 服务的 backend 注册表**——**接缝 = `shellCandidates` 配置（2026-11-15 已适配，见 M4 打磨实测）**：用户补丁层浅覆写该键加入 `plugin/bin/krun` 桥（node-pty 以会话 cwd spawn，桥内联 OSC 7777 转达 resize，会话未运行经 `/api/krun/ensure` 引导）；② **agent 的 `terminal_*` 工具**（dsh-tool-terminal：terminal_open/send/read/signal/kill/list）= terminals 服务的真正消费者，`terminal_open` 的 `type` 是**自由字符串参数**（`args.type.length === 0` 校验后直传 spawn 请求）。两条路径并存。
 - **诊断技巧**：`RUST_LOG=debug` 传给 boot 子进程（env_logger 尊重 RUST_LOG 覆盖 `krun_set_log_level` 的默认档），TSI/vsock 全链路 trace 可见。- **测试方法坑（非沙盒问题）**：busybox `nc` stdin 遇 EOF 立即退出（`punt!`，stdin=/dev/null 或管道读尽都会）——监听测试必须挂持久 stdin 或一次性应答器；Alpine busybox 无 `httpd` applet。
 - **agent 并发语义**：每连接一线程（并发 exec/终端 OK）；长驻子进程持有 stdout 管道会使该 exec 连接保持（`run_in_background` 场景正是所需语义）， abandoned 连接遗留 relay 线程（低危，VM 会话回收时一并终止）。
 - live patch 接线确认：用户层 `disable base sandbox 行 + insert sandbox-vm` 组合在 `--dump-config` 层叠正确（base 行 `disabled: true`、sandbox-vm 带配置插入、sandbox-policy/bash-sandbox 原样）。
@@ -578,17 +622,23 @@ ro/rw 双会话并存；`--network tsi|none` 双档（出站 TCP+DNS / 零端口
 **M3 管理界面**
 
 - [x] `/api/krun/status|stop|probe` 路由注册（401 前置 = 路由已挂）
-- [x] `/vm` 命令组（commands.register 全局单命令：status/stop/reset confirm；headless 激活 diag + 处理器直测）
-- [x] 镜像/工作区绑定 API（images、images/import、images/delete、workspaces/bind|unbind|reset；导入任务 409 串行）
-- [ ] 浏览器实测：Settings → "VM sandbox" 页（环境体检/会话/镜像/绑定四卡 + 状态芯片）——路由与数据通道已就绪，需用户在 GUI 复核渲染
-- [ ] `/vm` 命令的 composer 侧发现性实测（注册已验证，UI 补全/执行待用户）
+- [x] `/vm` 命令组（commands.register 全局单命令：status/stop/reset confirm；headless 激活 diag + 处理器直测；**用户 GUI 确认通过**）
+- [x] 镜像/工作区绑定 API（images、images/import、images/delete、workspaces/bind|unbind|reset；导入任务 409 串行）+ `/api/krun/ensure`（侧栏桥引导用）
+- [x] 设置页四卡 + 状态芯片 + 镜像预设清单（**用户 GUI 确认设置页与 /vm 通过**）
+- [ ] `/vm` 命令的 composer 侧发现性实测（注册已验证，UI 补全/执行待用户；设置页已确认）
 
 **M4 打磨**
 
-- [x] 镜像管理 v1（URL/tarball/dir/容器导出导入 + manifest + registry.json 绑定 + 删除保护 + Alpine 自动装 bash；导入 E2E：minirootfs 3.22 → 绑定 → 引导 ✓）
-- [ ] 镜像预设清单（管理页内置 2-3 个经测试的 URL 条目）
-- [ ] `network: tsi` + 应用层端口代理（"只暴露指定端口"组合）
-- [ ] qcow2、aarch64、诊断 skill、README
+- [x] 镜像管理 v1（URL/tarball/dir/容器导出导入 + manifest + registry.json 绑定 + 删除保护；导入 E2E：minirootfs 3.22 → 绑定 → 引导 ✓）
+- [x] 镜像预设清单（alpine-minirootfs 3.22 + ubuntu-base 24.04.3，均已导入 + 引导实测；管理页"预设（已测）"选择器）
+- [x] `network: none` + `portMap` 应用层端口转发（vsock 通道：宿主 127.0.0.1:<host> → guest；往返实测 ✓；stat fwdConns 免回收；1.19.x set_port_map 改名映射仅 backend CLI 保留）
+- [x] qcow2 数据层格式（qemu-img 建盘 + guest 内首启格式化 + e2fsprogs 自动补装；实测 ✓）
+- [x] 侧栏终端适配（shellCandidates + bin/krun 桥 + OSC 7777 resize + /api/krun/ensure；实测 ✓）
+- [x] 诊断 skill（diagnose-krun-vm-sandbox，ctx.skills.register 内联注册；headless diag 验证）
+- [x] aarch64 agent 预置（rust-lld 自包含 musl 静态构建实测 ✓、bake 按宿主架构选择；**VM 引导待 aarch64 主机实测**）
+- [ ] aarch64 VM 引导端到端（需 aarch64 libkrunfw + rootfs + 主机）
+- [ ] README 之外的独立排障文档（诊断 skill 已承载主要内容；可再出 troubleshooting.md）
+- [ ] `serve` 子命令与设计 §4.1 的守护进程形态决策收敛（当前 provider 直 spawn `boot`，一 VM 一进程）
 
 **遗留修正项**
 - [x] agent env 透传（父进程 execve 方案）
@@ -599,6 +649,7 @@ ro/rw 双会话并存；`--network tsi|none` 双档（出站 TCP+DNS / 零端口
 - [x] **stderr 分离（exec2 帧协议）**：合并流使官方拒绝分类（只查 stderr）永远 denied=false，拒绝标记/升级 UX 失效——本日实测发现并修复
 - [x] **confine 刷新 lastUse**：exec 路径会话此前不计时，会被空闲 GC 误杀
 - [x] **cwd 兜底**：confine 不再传 harness 进程 cwd，executor spawn cwd 经 exec 客户端 getcwd() 透传
+- [x] **agent fd 卫生（CLOEXEC）**：accept/dup/pipe 泄漏连接 fd 给 fork 子进程，后台存活子进程令 exec 挂死——实测发现并修复
+- [x] **waitForAgent ping/pong**：VMM 桥接 socket 早于 guest agent 就绪可连（qcow2 首启 mkfs 场景），以 ping 应答为就绪判据
 - [ ] 移除 provider 的 krunDiag 诊断标记（当前保留为排障手段，稳定一轮后清理）
-- [ ] `serve` 子命令与设计 §4.1 的守护进程形态未接线（当前 provider 直 spawn `boot`，一 VM 一进程，守护进程层暂缺——设计偏差，待 M4 决策收敛）
 - [ ] `krun_get_max_vcpus` 探测在内建沙盒下返回 -1（probe 需 /dev/kvm 可达；provider probe 已正确 fail-closed）

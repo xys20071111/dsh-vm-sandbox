@@ -7,15 +7,23 @@
 完整设计、实测记录与验证清单见 **[krun-vm-sandbox-design.md](krun-vm-sandbox-design.md)**
 （附录 C = 实测记录；附录 D = 验证 TODO）。
 
-## 能力一览（2026-11-14）
+## 能力一览（2026-11-15）
 
 - **Sandbox 接缝**：confine 落 VM、fail-closed、EROFS 拒绝方言 + 官方拒绝标记/升级提示
   （agent exec2 帧协议做 stdout/stderr 分离——官方拒绝分类只查 stderr）
-- **空闲回收**：idleStopMs + agent `stat` 活跃连接探测（run_in_background 长驻子进程免回收）
+- **空闲回收**：idleStopMs + agent `stat` 活跃连接探测（run_in_background 长驻子进程与
+  端口转发连接免回收）
 - **`/vm` 人类命令**：`/vm status`、`/vm stop [all|<key>|ro|rw]`、`/vm reset confirm`（两段式确认）
 - **镜像管理**：URL / tarball / 目录 / 容器导出导入到 `<dataDir>/images/<id>/`，
   manifest + `registry.json` 工作区绑定（boot 解析顺序 = 绑定 → imageRootfs）、
-  删除保护、Alpine 导入自动免 root 装 bash；管理页"镜像 / 工作区绑定"两卡
+  删除保护、Alpine 自动免 root 装包；管理页"镜像 / 工作区绑定"两卡 +
+  内置已测预设（alpine-minirootfs 3.22、ubuntu-base 24.04）
+- **侧栏终端**：GUI"新建终端"shell 选择器里的 `krun` 项（`plugin/bin/krun` 桥，
+  OSC 7777 resize 直达 guest PTY，会话未运行自动引导）
+- **端口转发**：`portMap: ["host:guest"]` = vsock 应用层转发（宿主绑 127.0.0.1），
+  `network: none` 档下即"零占用 + 只暴露指定端口"组合
+- **qcow2 数据层**：`dataDiskFormat: 'qcow2'`（qemu-img 建盘，guest 内首启格式化）
+- **诊断 skill**：`diagnose-krun-vm-sandbox`（全局 skill，排障路径 + 常见失败表）
 - **管理页**：Settings → "VM sandbox"（环境体检 / 运行会话 / 镜像 / 工作区绑定）+ composer 状态芯片
 
 ## 布局
@@ -23,13 +31,13 @@
 | 路径 | 内容 |
 |---|---|
 | `krun-vm-sandbox-design.md` | 设计文档（§1-14 设计；附录 A-D 接口/事实/实测/TODO） |
-| `backend/krun-backend/` | 宿主侧 Rust CLI：`probe` / `boot`（每会话一 VM 进程）/ `exec`（agent 客户端，exec2 帧解包）/ `serve`（预留） |
-| `backend/guest/dsh-vm-agent/` | guest 内代理（musl static-pie）：vsock:42 上的 exec（fork/execve + env 透传）、exec2（stdout/stderr/退出码帧分离）、term（PTY）、stat（活跃连接） |
+| `backend/krun-backend/` | 宿主侧 Rust CLI：`probe` / `boot`（每会话一 VM 进程，`--forward` 端口转发）/ `exec`（agent 客户端，exec2 帧解包）/ `serve`（预留） |
+| `backend/guest/dsh-vm-agent/` | guest 内代理（musl static-pie）：vsock:42 上的 exec（fork/execve + env 透传）、exec2（stdout/stderr/退出码帧分离）、term（PTY + OSC 7777 resize）、vsock 端口转发中继、stat（活跃连接）；全 fd CLOEXEC |
 | `backend/vendor/libkrun/` | **git submodule**：containers/libkrun `stable-1.19.x`，锁定 1.19.8 发布点（c4d283c2）；path 依赖 `src/libkrun`，可打补丁 |
-| `plugin/` | `@local/dsh-krun-vm` 插件：`index.js`（SandboxProvider + /vm 命令 + 镜像管理路由 + 空闲回收）、`terminal-backend.js`（persistent-shell 组内注册器）、`client.js`（设置页四卡 + 状态芯片）、`guest/setup.sh`（guest 内三层编排）、`bin/krun-backend`、`guest/dsh-vm-agent`（构建产物，已忽略） |
+| `plugin/` | `@local/dsh-krun-vm` 插件：`index.js`（SandboxProvider + /vm 命令 + 镜像管理路由 + 端口转发监听 + 空闲回收）、`diagnose-skill.js`（诊断 skill）、`terminal-backend.js`（persistent-shell 组内注册器）、`client.js`（设置页四卡 + 预设清单 + 状态芯片）、`guest/setup.sh`（guest 内三层编排 + 首启格式化）、`bin/krun`（侧栏终端桥）、`bin/krun-backend`、`guest/dsh-vm-agent{-aarch64,}`（构建产物，已忽略） |
 | `m0/` | 可行性尖峰：FFI 探针 / 引导冒烟（koffi 路线已弃用的实证） |
 | `harness/` | 接线工件：`krun-overlay.yml`（dsh --patch 用）、`krun-preset-override.yml`（三预设覆写生成物）、`krun-overlay-headless-*.yml`（headless 验证 overlay） |
-| `scripts/build.sh` | 构建并部署两个二进制到 `plugin/` |
+| `scripts/build.sh` | 构建并部署二进制到 `plugin/`（x86_64 + best-effort aarch64 agent） |
 
 ## 构建
 

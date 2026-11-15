@@ -14,7 +14,9 @@ use std::process::ExitCode;
 fn usage() -> ! {
     eprintln!("usage: krun-backend <probe|boot|exec|serve> [options]");
     eprintln!("  probe");
-    eprintln!("  boot --rootfs <p> [--console <f>] [--vcpus <n>] [--ram <mib>] [--agent-sock <p>] [--setup ro|rw] [--ws-path <p>] [--data-img <p>] [--network tsi|none] [--port-map host:guest] -- <command...>");
+    eprintln!("  boot --rootfs <p> [--console <f>] [--vcpus <n>] [--ram <mib>] [--agent-sock <p>] [--setup ro|rw] [--ws-path <p>] [--data-img <p>] [--data-format raw|qcow2] [--network tsi|none] [--port-map host:guest] [--forward host:guest] -- <command...>");
+    eprintln!("    --forward host:guest  应用层端口转发（重复可叠）：额外 vsock 端口桥接 UNIX socket（<agent-sock>.fwd<N>），");
+    eprintln!("                          agent 中继到 guest 127.0.0.1:<guest>；宿主侧由 provider 起 TCP 监听（none 档零占用组合）");
     eprintln!("  exec --socket <p> [--cwd <d>] -- <argv...>");
     eprintln!("  serve --socket <path>");
     std::process::exit(2);
@@ -129,13 +131,36 @@ fn cmd_probe() -> ExitCode {
 /// 命令行约定：`boot -- -- <program> <args...>`；exec_path = program，
 /// set_exec 的 args **不含程序名**（libkrun 的 argv 约定，见 api.rs）。
 /// 成功路径下 libkrun 在 FFI 内部 exit() 本进程，本函数只在启动前出错时返回。
-/// 确保稀疏 ext4 数据盘存在：缺失则创建并格式化（优先用提取的 mke2fs，宿主 PATH 兜底）。
-fn ensure_ext4_data_img(img: &std::path::Path, size_mib: u64) -> Result<(), String> {
+/// 确保数据盘文件存在：raw = ext4 稀疏盘（宿主 mkfs，经典路径）；qcow2 = qemu-img
+/// 创建空白盘（依赖宿主 qemu-img；文件系统由 guest 内 setup.sh 首次挂载失败时格式化）。
+fn ensure_data_img(img: &std::path::Path, size_mib: u64, format: &str) -> Result<(), String> {
     use std::io::{Read, Seek, SeekFrom, Write};
     if !img.exists() {
+        if format == "qcow2" {
+            let status = std::process::Command::new("qemu-img")
+                .args(["create", "-f", "qcow2"])
+                .arg(img)
+                .arg(format!("{}M", size_mib))
+                .status()
+                .map_err(|e| format!("spawn qemu-img: {e} (安装 qemu-utils 以使用 qcow2 数据层)"))?;
+            if !status.success() {
+                return Err(format!("qemu-img create failed: {status}"));
+            }
+            return Ok(());
+        }
         let mut f = std::fs::File::create(img).map_err(|e| e.to_string())?;
         f.set_len(size_mib * 1024 * 1024).map_err(|e| e.to_string())?;
         f.sync_all().map_err(|e| e.to_string())?;
+    }
+    if format == "qcow2" {
+        // qcow2 魔数 "QFI\xfb" 偏移 0
+        let mut f = std::fs::File::open(img).map_err(|e| e.to_string())?;
+        let mut magic = [0u8; 4];
+        f.read_exact(&mut magic).map_err(|e| e.to_string())?;
+        if magic == *b"QFI\xfb" {
+            return Ok(());
+        }
+        return Err("data img exists but is not qcow2".into());
     }
     // ext 超级块魔数 0xEF53 位于偏移 1080
     let mut f = std::fs::File::open(img).map_err(|e| e.to_string())?;
@@ -173,6 +198,8 @@ fn cmd_boot(args: &[String]) -> ExitCode {
     let mut data_img: Option<String> = None;
     let mut agent_sock: Option<String> = None;
     let mut port_map: Vec<String> = Vec::new();
+    let mut forwards: Vec<String> = Vec::new();
+    let mut data_format = String::from("raw");
     let mut network = String::from("tsi");
     let mut rest: Vec<String> = Vec::new();
     let mut i = 0;
@@ -186,12 +213,18 @@ fn cmd_boot(args: &[String]) -> ExitCode {
             "--setup-script" => { setup_script = args.get(i + 1).expect("--setup-script needs a value").clone(); i += 2; }
             "--ws-path" => { ws_path = Some(args.get(i + 1).expect("--ws-path needs a value").clone()); i += 2; }
             "--data-img" => { data_img = Some(args.get(i + 1).expect("--data-img needs a value").clone()); i += 2; }
+            "--data-format" => { data_format = args.get(i + 1).expect("--data-format needs a value").clone(); i += 2; }
             "--agent-sock" => { agent_sock = Some(args.get(i + 1).expect("--agent-sock needs a value").clone()); i += 2; }
             "--port-map" => { port_map.push(args.get(i + 1).expect("--port-map needs a value").clone()); i += 2; }
+            "--forward" => { forwards.push(args.get(i + 1).expect("--forward needs a value").clone()); i += 2; }
             "--network" => { network = args.get(i + 1).expect("--network needs a value").clone(); i += 2; }
             "--" => { rest = args[i + 1..].to_vec(); break; }
             other => { eprintln!("boot: unknown option {other}"); usage(); }
         }
+    }
+    if data_format != "raw" && data_format != "qcow2" {
+        eprintln!("boot: unknown data format {data_format} (expected raw|qcow2)");
+        usage();
     }
     let rootfs = rootfs.unwrap_or_else(|| { eprintln!("boot: --rootfs is required"); usage(); });
 
@@ -224,12 +257,14 @@ fn cmd_boot(args: &[String]) -> ExitCode {
         api::add_virtiofs(ctx, "workspace", &ws, 0, ws_ro, api::KRUN_SEMANTICS_LINUX_SIMPLIFIED)
             .expect("add_virtiofs workspace");
         if let Some(di) = &data_img {
-            // 数据层 = ext4 稀疏盘（virtio-blk）：overlayfs-on-ext4 是内核经典支持路径。
-            // virtiofs 目录作 upper 在内核 overlayfs workdir 创建处有 EACCES 摩擦（见附录 C）。
-            ensure_ext4_data_img(std::path::Path::new(di), 8192).expect("ensure data img");
-            api::add_disk(ctx, "data", di, api::KRUN_DISK_FORMAT_RAW, false, false, api::KRUN_SYNC_RELAXED)
+            // 数据层盘（virtio-blk）：overlayfs-on-ext4 是内核经典支持路径；qcow2 为
+            // 快照/克隆友好的可选容器格式（文件系统均由 guest 内挂载，见 setup.sh）。
+            ensure_data_img(std::path::Path::new(di), 8192, &data_format).expect("ensure data img");
+            let fmt = if data_format == "qcow2" { api::KRUN_DISK_FORMAT_QCOW2 } else { api::KRUN_DISK_FORMAT_RAW };
+            api::add_disk(ctx, "data", di, fmt, false, false, api::KRUN_SYNC_RELAXED)
                 .expect("add_disk data");
         }
+        let mut forward_env = Vec::new();
         if let Some(sock) = &agent_sock {
             // 控制通道：VMM 监听该 UNIX socket，每个连接桥接为 guest 内 vsock 连接。
             // 失败时干净退出（stderr 带原因），让 provider 的 waitForAgent 超时路径
@@ -237,6 +272,23 @@ fn cmd_boot(args: &[String]) -> ExitCode {
             if let Err(err) = api::add_vsock_port(ctx, 42, sock, true) {
                 eprintln!("krun-backend: add_vsock_port agent: {err}");
                 std::process::exit(1);
+            }
+            // 应用层端口转发：每条 --forward host:guest 配一个 vsock 端口（4200 起），
+            // VMM 桥接到 <agent-sock>.fwd<vport>；agent 以 DSH_FORWARD_PORTS 中继到
+            // guest 127.0.0.1:<guest>。宿主侧 TCP 监听由 provider 管理。
+            for (i, fwd) in forwards.iter().enumerate() {
+                let Some((host, guest)) = fwd.split_once(':') else {
+                    eprintln!("boot: --forward expects host:guest, got {fwd:?}");
+                    usage();
+                };
+                let vsock_port = 4200u32 + i as u32;
+                let fwd_sock = format!("{sock}.fwd{vsock_port}");
+                if let Err(err) = api::add_vsock_port(ctx, vsock_port, &fwd_sock, true) {
+                    eprintln!("krun-backend: add_vsock_port forward {host}:{guest}: {err}");
+                    std::process::exit(1);
+                }
+                forward_env.push(format!("{vsock_port}:{guest}"));
+                eprintln!("krun-backend: forward host:{host} -> vsock:{vsock_port} -> guest:{guest} (sock {fwd_sock})");
             }
         }
         if !port_map.is_empty() {
@@ -251,8 +303,12 @@ fn cmd_boot(args: &[String]) -> ExitCode {
         if agent_sock.is_some() {
             args_refs.push("agent");
         }
-        let envp = vec!["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "HOME=/root", "TERM=xterm-256color"];
-        api::set_exec(ctx, "/bin/sh", &args_refs, &envp).expect("set_exec");
+        let mut envp: Vec<String> = vec!["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into(), "HOME=/root".into(), "TERM=xterm-256color".into()];
+        if !forward_env.is_empty() {
+            envp.push(format!("DSH_FORWARD_PORTS={}", forward_env.join(",")));
+        }
+        let envp_refs: Vec<&str> = envp.iter().map(String::as_str).collect();
+        api::set_exec(ctx, "/bin/sh", &args_refs, &envp_refs).expect("set_exec");
         eprintln!("booting (setup mode={mode} agent={}) rootfs={rootfs} ws={ws} data-img={data_img:?} ...", agent_sock.is_some());
     } else {
         api::set_root(ctx, &rootfs).expect("set_root");

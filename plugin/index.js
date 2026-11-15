@@ -16,7 +16,7 @@
 
 import { execFile, spawn } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { connect as netConnect } from 'node:net';
+import { connect as netConnect, createServer as netCreateServer } from 'node:net';
 import { chmodSync, createWriteStream, cpSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -24,6 +24,7 @@ import { homedir, tmpdir } from 'node:os';
 
 import { SandboxProvider, SandboxUnavailableError, canonicalPath } from '@deepseek-ai/dsh-sandbox';
 import z from '@deepseek-ai/schemastery';
+import { KRUN_DIAGNOSIS_SKILL } from './diagnose-skill.js';
 
 const PKG_DIR = dirname(fileURLToPath(import.meta.url));
 const GUEST_AGENT = join(PKG_DIR, 'guest', 'dsh-vm-agent-x86_64');
@@ -137,33 +138,40 @@ function containerExportTar(engine, container, destTar) {
   });
 }
 
-/** Alpine 系镜像免 root 装 bash（M1 实测的 loader 技巧）；非 Alpine/已有 bash 时跳过。
- *  判定以 bash 二进制落地为准——apk 对 chroot 触发器报 EPERM 可忽略（无真 chroot）。 */
-async function ensureBash(rootfs) {
-  const hasBash = () => existsSync(join(rootfs, 'bin', 'bash')) || existsSync(join(rootfs, 'usr', 'bin', 'bash'));
-  try {
-    if (hasBash()) return { ok: true };
-    const apk = join(rootfs, 'sbin', 'apk');
-    const libs = join(rootfs, 'lib');
-    const loader = existsSync(libs)
-      ? readdirSync(libs).find((f) => f.startsWith('ld-musl-'))
-      : undefined;
-    if (!existsSync(apk) || !loader) return { ok: false, warning: null };
-    let stderr = '';
-    try {
-      await runFile(join(libs, loader), [apk, '--root', rootfs, 'add', 'bash'], {
-        env: { LD_LIBRARY_PATH: `${libs}:${join(rootfs, 'usr', 'lib')}`, PATH: '/usr/bin:/bin' },
-        timeout: 300000,
-      });
-    } catch (e) {
-      stderr = String(e?.stderr || e?.message || e);
-    }
-    return hasBash()
-      ? { ok: true }
-      : { ok: false, warning: stderr.slice(0, 300) || 'apk add bash produced no binary' };
-  } catch (e) {
-    return { ok: false, warning: String(e?.stderr || e?.message || e).slice(0, 300) };
+/** guest 内系统包保障：Alpine 系经免 root loader-apk 装入（宿主网络，幂等——已存在则跳过）；
+ *  非 Alpine 镜像要求自带。bash 是 bash 工具的硬前提；qcow2 数据层的首次格式化需要
+ *  e2fsprogs（raw 路径宿主预格式化，不需要）。 */
+async function ensureGuestPackages(rootfs, extra = []) {
+  const has = (...paths) => paths.some((p) => existsSync(join(rootfs, p)));
+  const need = [];
+  if (!has('bin/bash', 'usr/bin/bash')) need.push('bash');
+  for (const p of extra) {
+    if (p === 'e2fsprogs' && has('usr/sbin/mkfs.ext4', 'sbin/mkfs.ext4')) continue;
+    need.push(p);
   }
+  if (need.length === 0) return { installed: [], warning: null };
+  const apk = join(rootfs, 'sbin', 'apk');
+  const libs = join(rootfs, 'lib');
+  const loader = existsSync(libs)
+    ? readdirSync(libs).find((f) => f.startsWith('ld-musl-'))
+    : undefined;
+  if (!existsSync(apk) || !loader) {
+    return { installed: [], warning: `non-alpine image missing [${need.join(', ')}]` };
+  }
+  let stderr = '';
+  try {
+    await runFile(join(libs, loader), [apk, '--root', rootfs, 'add', ...need], {
+      env: { LD_LIBRARY_PATH: `${libs}:${join(rootfs, 'usr', 'lib')}`, PATH: '/usr/bin:/bin' },
+      timeout: 300000,
+    });
+  } catch (e) {
+    stderr = String(e?.stderr || e?.message || e);
+  }
+  // 判定以产物落地为准（apk 对 chroot trigger 报 EPERM 可忽略）
+  const ok = need.every((p) => (p === 'bash' ? has('bin/bash', 'usr/bin/bash') : p !== 'e2fsprogs' || has('usr/sbin/mkfs.ext4', 'sbin/mkfs.ext4')));
+  return ok
+    ? { installed: need, warning: null }
+    : { installed: [], warning: stderr.slice(0, 300) || `apk add [${need.join(', ')}] produced no binaries` };
 }
 
 /** 目录树占用字节数（du -sb）。 */
@@ -205,7 +213,7 @@ async function runImportJob(dataDir, job, req, diag = () => {}) {
     await extractRootfsTar(tar, rootfs);
     source = `${engine}:${String(req.container)}`;
   }
-  const bash = await ensureBash(rootfs);
+  const pkgs = await ensureGuestPackages(rootfs, req.dataDiskFormat === 'qcow2' ? ['e2fsprogs'] : []);
   const manifest = {
     id,
     name: String(req.name ?? '') || basename(source || id),
@@ -215,8 +223,8 @@ async function runImportJob(dataDir, job, req, diag = () => {}) {
     source: `${job.kind}:${source ?? ''}`,
     format: 'dir',
     sizeBytes: await duBytes(imgDir),
-    bashReady: bash.ok,
-    ...(bash.warning ? { warning: bash.warning } : {}),
+    bashReady: existsSync(join(rootfs, 'bin', 'bash')) || existsSync(join(rootfs, 'usr', 'bin', 'bash')),
+    ...(pkgs.warning ? { warning: pkgs.warning } : {}),
   };
   writeFileSync(join(imgDir, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
   job.status = 'done';
@@ -256,8 +264,13 @@ export class KrunSandboxProvider extends SandboxProvider {
      *  none = 隔离（vsock 控制通道保留，宿主零端口占用）。
      *  本版 schemastery 无 enumerator，枚举 = union(const)。 */
     network: z.union([z.const('tsi'), z.const('none')]).default('tsi'),
-    /** 显式端口映射 ["host:guest", …]；空 = libkrun 自动暴露 guest 全部监听端口。 */
+    /** 显式端口映射 ["host:guest", …]：应用层端口转发（vsock 通道，宿主监听 127.0.0.1:<host>）。
+     *  network=none 档下的"零宿主端口占用 + 只暴露指定端口"组合即由此实现；
+     *  tsi 档自动暴露之外这是额外直达通道。空 = 无转发。 */
     portMap: z.array(z.string()).default([]),
+    /** 数据层盘格式：raw（ext4 稀疏盘，经典路径）/ qcow2（快照/克隆友好，需宿主 qemu-img，
+     *  首次启动由 guest 内格式化）。 */
+    dataDiskFormat: z.union([z.const('raw'), z.const('qcow2')]).default('raw'),
   });
 
   /** 诊断标记：追加到 <dataDir>/diag.log（激活/路由排查用；一次性手段，收敛后移除）。 */
@@ -296,6 +309,25 @@ export class KrunSandboxProvider extends SandboxProvider {
       this.krunDiag('commands inject callback fired');
       this.krunRegisterCommands(injectCtx);
     });
+    // 诊断 skill（仿 windows-acl）：skills 注册表根作用域可用，内联 runtime 注册。
+    ctx.inject(['skills'], (injectCtx) => {
+      this.krunDiag('skills inject callback fired');
+      try {
+        this.krunCtx.effect(() => {
+          this.krunDiag('registered diagnose-krun-vm-sandbox');
+          return injectCtx.skills.register({
+            name: KRUN_DIAGNOSIS_SKILL.name,
+            description: KRUN_DIAGNOSIS_SKILL.description,
+            whenToUse: KRUN_DIAGNOSIS_SKILL.whenToUse,
+            source: KRUN_DIAGNOSIS_SKILL.source,
+            resourceBase: KRUN_DIAGNOSIS_SKILL.resourceBase,
+            content: KRUN_DIAGNOSIS_SKILL.content,
+          });
+        }, 'krun-vm: diagnose skill');
+      } catch (err) {
+        this.krunDiag(`register skill THREW: ${err?.message ?? err}`);
+      }
+    });
   }
 
   krunRegisterRoutes(webServer) {
@@ -315,10 +347,12 @@ export class KrunSandboxProvider extends SandboxProvider {
       config: {
         enabled: this.krunConfig.enabled,
         dataDir: this.krunDataDir,
+        bridgePath: join(PKG_DIR, 'bin', 'krun'),
         imageRootfs: this.krunConfig.imageRootfs,
         idleStopMs: this.krunConfig.idleStopMs,
         network: this.krunConfig.network,
         portMap: this.krunConfig.portMap ?? [],
+        dataDiskFormat: this.krunConfig.dataDiskFormat ?? 'raw',
         resources: this.krunConfig.resources,
       },
       sessions: [...this.sessions.values()].map((s) => ({
@@ -374,6 +408,24 @@ export class KrunSandboxProvider extends SandboxProvider {
         sendJson(res, 200, { ok: true, probe: (await this.probe()) });
       },
     }, 'krun-vm: POST /api/krun/probe');
+    registerRoute({
+      kind: 'exact',
+      path: '/api/krun/ensure',
+      handler: async (req, res) => {
+        if (req.method !== 'POST') { res.writeHead(405); res.end(); return; }
+        const body = await readBody(req);
+        const ws = String(body.ws ?? '');
+        const mode = body.mode === 'ro' ? 'ro' : 'rw';
+        if (!ws.startsWith('/')) { sendJson(res, 400, { ok: false, err: 'ws must be an absolute path' }); return; }
+        try {
+          const session = await this.ensureSession({ mode, workspaceRoot: ws });
+          session.lastUse = Date.now();
+          sendJson(res, 200, { ok: true, key: session.key, ws: session.ws, mode: session.mode });
+        } catch (err) {
+          sendJson(res, 200, { ok: false, err: String(err?.message ?? err) });
+        }
+      },
+    }, 'krun-vm: POST /api/krun/ensure');
     registerRoute({
       kind: 'exact',
       path: '/api/krun/images',
@@ -683,8 +735,8 @@ export class KrunSandboxProvider extends SandboxProvider {
   }
 
   /** 空闲回收：无活跃终端/连接且超过 idleStopMs 的会话优雅停机（数据层天然落盘）。
-   *  活跃连接判定：liveTerminals（本 provider 的终端）∪ agent stat（exec/term 连接，
-   *  覆盖 run_in_background 长驻子进程持有的连接，设计 §7"无活动连接"语义）。 */
+   *  活跃连接判定：liveTerminals（本 provider 的终端）∪ agent stat（exec/term/fwd 连接，
+   *  覆盖 run_in_background 长驻子进程与端口转发连接，设计 §7"无活动连接"语义）。 */
   async krunGcIdle() {
     const idle = this.krunConfig.idleStopMs ?? 600000;
     if (!idle) return;
@@ -693,7 +745,7 @@ export class KrunSandboxProvider extends SandboxProvider {
       if ((s.liveTerminals ?? 0) > 0) continue;
       if (now - (s.lastUse ?? now) <= idle) continue;
       const stat = await this.krunAgentStat(s);
-      if (stat && (stat.execConns > 0 || stat.termConns > 0)) {
+      if (stat && (stat.execConns > 0 || stat.termConns > 0 || stat.fwdConns > 0)) {
         s.lastUse = now; // 有活动连接：视为在用，刷新计时
         continue;
       }
@@ -725,12 +777,16 @@ export class KrunSandboxProvider extends SandboxProvider {
     return this.krunProbeCache;
   }
 
-  /** 把 guest 侧文件烤入镜像树（幂等）。 */
+  /** 把 guest 侧文件烤入镜像树（幂等）。agent 按宿主架构选择：guest 架构 = KVM 宿主
+   *  架构；aarch64 预置二进制存在且宿主为 arm64 时使用（aarch64 引导待 aarch64 主机实测）。 */
   bakeGuestFiles(imageRootfs) {
+    const agentBin = process.arch === 'arm64' && existsSync(join(PKG_DIR, 'guest', 'dsh-vm-agent-aarch64'))
+      ? join(PKG_DIR, 'guest', 'dsh-vm-agent-aarch64')
+      : GUEST_AGENT;
     const agentDst = join(imageRootfs, 'usr', 'bin', 'dsh-vm-agent');
     const setupDst = join(imageRootfs, 'dsh-setup');
     mkdirSync(dirname(agentDst), { recursive: true });
-    writeFileSync(agentDst, readFileSync(GUEST_AGENT));
+    writeFileSync(agentDst, readFileSync(agentBin));
     chmodSync(agentDst, 0o755);
     writeFileSync(setupDst, readFileSync(GUEST_SETUP));
     chmodSync(setupDst, 0o755);
@@ -746,15 +802,19 @@ export class KrunSandboxProvider extends SandboxProvider {
     while (Date.now() < deadline) {
       if (signal?.aborted) throw new Error('aborted while waiting for agent');
       if (existsSync(sockPath)) {
+        // socket 文件在 VMM 绑定 vsock 端口时即出现（guest 侧 agent 可能还在引导，
+        // 如 qcow2 首次 guest 内 mkfs）——以 ping/pong 确认 agent 真正就绪
         const ok = await new Promise((res) => {
           const s = netConnect({ path: sockPath }, () => {
-            s.destroy();
-            res(true);
+            s.write(`${JSON.stringify({ type: 'ping' })}\n`);
           });
-          s.on('error', () => {
-            s.destroy();
-            res(false);
+          let buf = '';
+          const timer = setTimeout(() => { s.destroy(); res(false); }, 1200);
+          s.on('data', (d) => {
+            buf += d;
+            if (buf.includes('"ok":true')) { clearTimeout(timer); s.destroy(); res(true); }
           });
+          s.on('error', () => { clearTimeout(timer); s.destroy(); res(false); });
         });
         if (ok) return;
       }
@@ -793,6 +853,11 @@ export class KrunSandboxProvider extends SandboxProvider {
       throw new SandboxUnavailableError(policy.mode, `krun VM unavailable — no image for ${ws} (import an image or set imageRootfs)`);
     }
     this.bakeGuestFiles(imageRootfs);
+    // qcow2 数据层首次启动在 guest 内格式化：镜像缺 e2fsprogs 时按需补装（宿主网络，幂等）
+    if ((this.krunConfig.dataDiskFormat ?? 'raw') === 'qcow2') {
+      const pkgs = await ensureGuestPackages(imageRootfs, ['e2fsprogs']);
+      if (pkgs.warning) this.krunDiag(`guest pkgs warning: ${pkgs.warning}`);
+    }
 
     const runDir = join(this.krunDataDir, 'run');
     const logDir = join(this.krunDataDir, 'logs');
@@ -819,7 +884,8 @@ export class KrunSandboxProvider extends SandboxProvider {
       confineArgs.push('--data-img', img);
     }
     if (this.krunConfig.network === 'none') confineArgs.push('--network', 'none');
-    for (const pm of this.krunConfig.portMap ?? []) confineArgs.push('--port-map', pm);
+    for (const pm of this.krunConfig.portMap ?? []) confineArgs.push('--forward', pm);
+    if ((this.krunConfig.dataDiskFormat ?? 'raw') === 'qcow2') confineArgs.push('--data-format', 'qcow2');
 
     const env = { ...process.env };
     const libDir = expandHome(this.krunConfig.libDir);
@@ -832,7 +898,7 @@ export class KrunSandboxProvider extends SandboxProvider {
     });
     out.close?.();
 
-    const session = { key, child, agentSock: sockPath, ws, mode, image: imageRootfs, logPath, lastUse: Date.now(), startedAt: Date.now(), liveTerminals: 0 };
+    const session = { key, child, agentSock: sockPath, ws, mode, image: imageRootfs, logPath, lastUse: Date.now(), startedAt: Date.now(), liveTerminals: 0, fwdServers: [] };
     const aborter = new AbortController();
     const onAbort = () => aborter.abort();
     signal?.addEventListener('abort', onAbort, { once: true });
@@ -844,7 +910,31 @@ export class KrunSandboxProvider extends SandboxProvider {
     } finally {
       signal?.removeEventListener('abort', onAbort);
     }
-    child.on('exit', () => this.sessions.delete(key));
+    child.on('exit', () => {
+      for (const srv of session.fwdServers ?? []) { try { srv.close(); } catch { /* 已关闭 */ } }
+      this.sessions.delete(key);
+    });
+    // 应用层端口转发：宿主 127.0.0.1:<host> → run/<key>.fwd<vsock> → agent → guest 127.0.0.1:<guest>
+    for (const [i, entry] of (this.krunConfig.portMap ?? []).entries()) {
+      const [host, guest] = String(entry).split(':').map((v) => Number.parseInt(v, 10));
+      if (!Number.isInteger(host) || !Number.isInteger(guest)) {
+        throw new SandboxUnavailableError(policy.mode, `invalid portMap entry ${entry} (expect host:guest)`);
+      }
+      const fwdSock = `${sockPath}.fwd${4200 + i}`;
+      const srv = netCreateServer((conn) => {
+        const up = netConnect({ path: fwdSock }, () => {
+          conn.pipe(up);
+          up.pipe(conn);
+        });
+        up.on('error', () => conn.destroy());
+        conn.on('error', () => up.destroy());
+      });
+      await new Promise((res, rej) => {
+        srv.once('error', rej);
+        srv.listen(host, '127.0.0.1', () => res());
+      });
+      session.fwdServers.push(srv);
+    }
     this.sessions.set(key, session);
     this.booting.delete(key);
     return session;

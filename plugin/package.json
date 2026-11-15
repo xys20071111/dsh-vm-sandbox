@@ -11,7 +11,8 @@
     "./package.json": "./package.json",
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg",
-    "./client": "./client.js"
+    "./client": "./client.js",
+    "./diagnose-skill": "./diagnose-skill.js"
   },
   "files": [
     "index.js",
@@ -22,7 +23,8 @@
     "icon.svg",
     "bin/krun-backend",
     "guest/dsh-vm-agent-x86_64",
-    "guest/setup.sh"
+    "guest/setup.sh",
+    "diagnose-skill.js"
   ],
   "engines": {
     "dsh": "0.2.2-rc.1"

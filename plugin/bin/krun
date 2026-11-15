@@ -1,0 +1,112 @@
+#!/usr/bin/env node
+// 侧栏终端桥：GUI"新建终端"shell 选择器里的 krun 项。
+//
+// 路径：terminalController（dsh-api-terminal-controller）的 shellCandidates 配置加入本
+// 脚本绝对路径 → shells() 经 subprocess.resolveExecutable 验证 → 选择后 node-pty 以
+// 会话工作目录为 cwd spawn 本脚本（argv 附带 '-i'，忽略）。
+//
+// 桥接：cwd → (workspace, rw) 会话键 → run/<key>.sock（agent 控制通道）；stdin/stdout
+// 与 agent term 通道双向中继。窗口尺寸变化经 SIGWINCH → 以内联 OSC 7777 序列写入
+// 输入流，agent 侧扫描后应用 TIOCSWINSZ（不落盘）。会话未运行时尽力经
+// /api/krun/ensure 引导（live web 部署；headless 无此路由则提示先跑一条受限命令）。
+import { connect } from 'node:net';
+import { createHash } from 'node:crypto';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+
+const ws = process.cwd();
+const dataDir = process.env.KRUN_DATA_DIR
+  || (process.env.DSH_HOME?.trim() ? join(process.env.DSH_HOME.trim(), 'storages', 'krun-vm') : join(homedir(), '.dsh', 'storages', 'krun-vm'));
+const key = createHash('sha1').update(ws).update('\0').update('rw').digest('hex').slice(0, 16);
+const sock = join(dataDir, 'run', `${key}.sock`);
+const ensureUrl = process.env.KRUN_ENSURE_URL ?? 'http://127.0.0.1:3080/api/krun/ensure';
+
+// raw 模式尽早开启（本进程的宿主 PTY 关闭输出加工，guest 侧 \r\n 原样透传）；
+// 非 TTY 环境（异常部署）降级继续。
+try { process.stdin.setRawMode(true); } catch { /* 非 TTY */ }
+
+const say = (msg) => process.stdout.write(`\r\n${msg}\r\n`);
+
+async function ensureSession() {
+  try {
+    const r = await fetch(ensureUrl, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ws }),
+      signal: AbortSignal.timeout(30000),
+    });
+    const d = await r.json().catch(() => ({}));
+    return Boolean(d?.ok);
+  } catch {
+    return false;
+  }
+}
+
+async function waitForSock() {
+  const deadline = Date.now() + 30000;
+  let ensured = false;
+  while (Date.now() < deadline) {
+    if (await new Promise((res) => {
+      const s = connect({ path: sock }, () => { s.destroy(); res(true); });
+      s.on('error', () => { s.destroy(); res(false); });
+    })) return true;
+    if (!ensured) {
+      ensured = true;
+      say(`krun: 正在引导 VM 会话（${ws}）…`);
+      await ensureSession();
+    }
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  return false;
+}
+
+const main = async () => {
+  if (!(await waitForSock())) {
+    say('krun: VM 会话不可用——请先在该会话里运行一条受限命令（或检查 provider 是否激活）。');
+    process.exit(1);
+  }
+  const conn = connect({ path: sock });
+  conn.on('error', () => process.exit(1));
+  await new Promise((res, rej) => {
+    const t = setTimeout(() => { conn.destroy(); rej(new Error('connect timeout')); }, 10000);
+    conn.once('connect', () => { clearTimeout(t); res(); });
+    conn.once('error', (e) => { clearTimeout(t); rej(e); });
+  });
+  const cols = process.stdout.columns ?? 80;
+  const rows = process.stdout.rows ?? 24;
+  conn.write(`${JSON.stringify({ type: 'term', cwd: ws, cols, rows })}\n`);
+
+  let exitCode = null;
+  let carry = ''; // 未完整的尾行（代理收尾行 "EXIT:<code>" 可能跨块到达）
+  const stripExit = (text) => {
+    const m = text.match(/(\r?\n)?EXIT:(\d+)\r?\n$/);
+    if (m) {
+      exitCode = Number.parseInt(m[2], 10);
+      return text.slice(0, m.index);
+    }
+    return text;
+  };
+  conn.on('data', (chunk) => {
+    carry += typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+    const nl = carry.lastIndexOf('\n');
+    if (nl >= 0) {
+      const complete = carry.slice(0, nl + 1);
+      carry = carry.slice(nl + 1);
+      process.stdout.write(stripExit(complete));
+    }
+  });
+  conn.on('close', () => {
+    process.stdout.write(stripExit(carry));
+    process.exit(exitCode ?? 0);
+  });
+
+  const sendResize = () => { try { conn.write(`\x1b]7777;resize;${process.stdout.columns ?? 80};${process.stdout.rows ?? 24}\x07`); } catch { /* 会话已关 */ } };
+  process.stdout.on('resize', sendResize);
+  sendResize(); // 以本进程实际 PTY 尺寸为准（请求里的 cols/rows 只是初值）
+  process.stdin.pipe(conn);
+};
+
+main().catch((err) => {
+  say(`krun: ${err?.message ?? err}`);
+  process.exit(1);
+});
