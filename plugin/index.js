@@ -343,7 +343,7 @@ export class KrunSandboxProvider extends SandboxProvider {
     const readBody = (req) => new Promise((res) => {
       let raw = '';
       req.on('data', (c) => { raw += c; });
-      req.on('end', () => { try { res.resolve(JSON.parse(raw || '{}')); } catch { res({}); } });
+      req.on('end', () => { try { res(JSON.parse(raw || '{}')); } catch { res({}); } });
     });
     this.krunStatusSnapshot = () => ({
       ok: true,
