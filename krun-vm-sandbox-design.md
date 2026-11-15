@@ -356,6 +356,7 @@ class KrunVmService extends Service {
 ## 12. 安全模型与边界（如实陈述）
 
 1. **强边界**：命令运行于独立内核（KVM），宿主机进程/文件系统对 guest 不可见；暴露面仅三个明确对象：镜像树（virtiofs RO）、**数据层盘文件**（virtio-blk，其内容即"工作区数据层"，guest 全权写入属设计意图，不出工作区存储域）、工作区目录（virtiofs）；无宿主挂载操作、无宿主 `/dev` 直通。enforcement 如实上报 `full`。
+2. **工作区归属映射（2026-11-15 实测澄清）**：guest 默认以 root 操作，但 virtiofs 的归属由 **VMM 进程凭据**决定——guest root 创建的工作区文件在宿主上归属 = 启动 harness 的用户（非 root），guest 侧看到的也是宿主真实 uid（1:1 映射，非 root 的 guest 用户照样能写"自己的"工作区）。两条不变量：① 宿主归属恒为 VMM uid（标准部署 = 登录用户），不存在"guest root 文件污染宿主归属"问题；② guest 对工作区的实际写权限被 VMM 凭据约束，guest root 并非宿主侧 god-mode。据此**保持 guest 默认 root**——这是"系统级副作用持久化"（apk/apt 装包等）的设计前提；若改为同 uid 普通用户作默认， guest 内系统级操作将失效，而宿主归属不会因此更正确。
 2. **不覆盖面**（与 libkrun 官方安全模型、DSH 沙盒词汇一致）：网络（TSI 共享宿主网络；`network:'none'` 才隔离）、宿主资源消耗（CPU/RAM 由 vCPU/RAM 配置钳制）、旁路通道（工作区目录是宿主与 guest 的共享写面——guest 可写宿主工作区内任何文件，这是设计意图而非缺陷，但意味着"VM 内命令写坏工作区"仍是可能的）。
 3. **非 Raw 磁盘镜像风险**：若采用 qcow2 镜像格式（含后续 backing 链），遵循 `krun_add_disk2/3` 的 SECURITY NOTE——格式探测只允许在 guest 拿到写权限之前、对可信镜像执行一次并记住结果。
 4. **权限边界**：supervisor 以 harness 用户身份运行，**无 namespace、无提权需求**；/dev/kvm 访问权交给部署者。
@@ -571,11 +572,18 @@ qcow2 数据层（guest 内首启格式化 + 持久化）；侧栏终端桥（�
   aarch64-unknown-linux-musl 成功（静态，无外部 musl 交叉 gcc 依赖）；build.sh best-effort
   产出 `plugin/guest/dsh-vm-agent-aarch64`；provider bake 按宿主架构选择。aarch64 VM 引导
   需 aarch64 libkrunfw + rootfs（x86_64 主机不可实测，待 aarch64 主机）。
+- **数据层目录迁移（本日早前）**：默认 dataDir 迁入 `~/.dsh/storages/krun-vm`（详见上文
+  M3-M4 段）；live 重启实测迁移完成，绑定/镜像/数据盘完好。
 - **诊断 skill**：`diagnose-krun-vm-sandbox` 以 `ctx.skills.register` 内联注册（根作用域 =
   全局；`skills` 注册表根作用域可用——web-app 只禁了 filesystem provider 与 tool-skill）。
   内容：结构化错误 → probe → boot log（会话键公式 + 常见结尾表）→ dump-config → headless
   冒烟 → 意图核对（空闲回收/网络档/侧栏接缝）→ 破坏类操作 user-only。headless diag
   全链验证（`registered diagnose-krun-vm-sandbox`）+ 限制命令回归通过。
+- **工作区归属映射验证（用户问询驱动）**：guest root `touch <ws>/f` → 宿主归属 = harness
+  用户（VMM 凭据），**非 root**；guest 侧 `ls` 见宿主真实 uid（1000:1000）；guest 内建
+  uid1000 用户后 `su -c 'touch <ws>/f2'` 直写成功（rc=0），宿主归属同样正确。结论：无
+  "guest root 文件污染宿主归属"问题，不需要同 uid 默认用户；guest 默认 root 保持（§12.2
+  已澄清两条不变量）。
 
 ### M2 实测记录（2026-11-14 下午，手动 backend 会话 + harness 集成）
 
