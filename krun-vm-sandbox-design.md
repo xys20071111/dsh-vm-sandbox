@@ -403,7 +403,11 @@ class KrunVmService extends Service {
 
 ### 15.2 运行形态（当前 live 配置）
 
-- provider 直 spawn `boot` 子进程（一 VM 一进程，`serve` 守护进程层未接线——设计偏差见附录 D）
+- **会话守护进程（serve，2026-11-15 接线）**：provider 经 UNIX socket JSON 行协议调用
+  `session.ensure/stop/touch/list/gc` + `shutdown`；守护进程持会话注册表、spawn 并监督 boot
+  子进程（PDEATHSIG 绑定）、执行端口转发监听与空闲回收；exec/终端数据面仍直连 agent.sock
+  不过守护进程。`config.daemon`（默认 true）= false 走遗留直 spawn 路径。跨进程共享：同
+  dataDir 的 live/headless 客户端共用同一 VM（会话键相同即复用，配置指纹不同则停旧启新）。
 - `network: none`（用户要求零宿主端口占用；切 `tsi` 即得共享宿主网络 + 自动端口暴露）
 - 资源 2 vCPU / 2048 MiB，`idleStopMs` 600000（空闲回收 fiber effect 已接 + agent stat 活跃连接保护）
 - 数据层：`<dataDir>/workspaces/<ws+mode 哈希>.img`（8.5G 稀疏，ext4 upper）；dataDir 默认
@@ -425,7 +429,7 @@ qcow2 数据层（guest 内首启格式化 + 持久化）；侧栏终端桥（�
 - `port_map` 的 1.19.x 改名映射语义仅 backend CLI 保留；provider `portMap` 配置现为 vsock 应用层转发（宿主绑 127.0.0.1，转发连接计入活跃）
 - agent resize 经内联 OSC 7777（仅桥与 agent 同代时生效；用户粘贴含该序列的数据会被吞——极小概率，如实记录）
 - PTY resize 链路：侧栏桥/agent 工具路径均已支持；GUI 侧栏 shell 选择器里 krun 项经用户补丁层 `shellCandidates` 接线（dsh 更新后需复核默认候选列表）
-- `serve` 守护进程形态未接线（provider 直 spawn boot）
+- `serve` 守护进程已接线（默认）：boot 引导经长寿 spawner 线程执行，PDEATHSIG 绑守护进程生命——客户端断开不杀 VM；dsh 崩溃沿进程树回收全部 VM
 - cordis 预设（创造模式）按用户要求未接入终端组
 - busybox 测试坑：nc 遇 stdin EOF 即退（`punt!`）、无 httpd applet——均非沙盒问题
 - exec2 帧协议为 v2 增量：旧镜像内 agent 走合并流回退（stderr 不分离 → 拒绝分类失效），boot 时 bakeGuestFiles 自动烤入新 agent，滚动更新自愈
@@ -572,6 +576,20 @@ qcow2 数据层（guest 内首启格式化 + 持久化）；侧栏终端桥（�
   aarch64-unknown-linux-musl 成功（静态，无外部 musl 交叉 gcc 依赖）；build.sh best-effort
   产出 `plugin/guest/dsh-vm-agent-aarch64`；provider bake 按宿主架构选择。aarch64 VM 引导
   需 aarch64 libkrunfw + rootfs（x86_64 主机不可实测，待 aarch64 主机）。
+- **会话守护进程接线（`serve`，§4.1 决策收敛）**：`cmd_serve` 从 ping 回显骨架升级为完整
+  实现（serve.rs 独立模块）。方法集：ping / session.ensure（单飞：in_flight set + Condvar；
+  fingerprint 不匹配 → 停旧启新）/ session.stop / session.touch（confine 计活跃）/
+  session.list / session.gc（agent stat 探活跃连接，覆盖全部客户端）/ shutdown。生命周期：
+  provider 首次 ensure 懒 spawn（detached，继承 LD_LIBRARY_PATH）；无客户端且无会话 60s
+  空闲退出并清 socket；disposer 发 shutdown（§7：HMR/卸载停会话，数据层持久）。boot 引导经
+  **长寿 spawner 线程**执行（PDEATHSIG 绑守护进程而非发起连接的线程——客户端断开不杀 VM）。
+  实测：daemon 引导 + exec ✓；第二客户端同 key ensure 复用 ✓（跨进程共享，live/headless
+  不再互抢 socket）；客户端断开会话存活 ✓；配置漂移停旧启新 ✓；`/vm stop` → daemon stop ✓；
+  node 退出 → 进程树全灭（PDEATHSIG 链）✓；headless 全链 ✓；`daemon:false` legacy 路径
+  回归 ✓。**过程修坑**：① serde 字段 camelCase 对齐（rename_all）；② daemon 侧 mkdir
+  （run/、workspaces/ 父目录——legacy 由 provider 预建）；③ agent ping 匹配用 windows(8)
+  对 9 字节模式永不命中（改 contains）；④ ensureSession 缓存落账漏 daemon 分支 + booting
+  成功路径不清理（gc 回收后同 key 永拿死 promise）。
 - **数据层目录迁移（本日早前）**：默认 dataDir 迁入 `~/.dsh/storages/krun-vm`（详见上文
   M3-M4 段）；live 重启实测迁移完成，绑定/镜像/数据盘完好。
 - **诊断 skill**：`diagnose-krun-vm-sandbox` 以 `ctx.skills.register` 内联注册（根作用域 =
@@ -646,7 +664,7 @@ qcow2 数据层（guest 内首启格式化 + 持久化）；侧栏终端桥（�
 - [x] aarch64 agent 预置（rust-lld 自包含 musl 静态构建实测 ✓、bake 按宿主架构选择；**VM 引导待 aarch64 主机实测**）
 - [ ] aarch64 VM 引导端到端（需 aarch64 libkrunfw + rootfs + 主机）
 - [ ] README 之外的独立排障文档（诊断 skill 已承载主要内容；可再出 troubleshooting.md）
-- [ ] `serve` 子命令与设计 §4.1 的守护进程形态决策收敛（当前 provider 直 spawn `boot`，一 VM 一进程）
+- [x] `serve` 守护进程接线（设计 §4.1 收敛）：注册表/单飞 ensure/配置指纹/监督/gc/转发监听/空闲退出；跨进程共享 + PDEATHSIG 链实测 ✓（`daemon:false` 为遗留直 spawn 逃生开关）
 
 **遗留修正项**
 - [x] agent env 透传（父进程 execve 方案）

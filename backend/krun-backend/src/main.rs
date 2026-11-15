@@ -1,36 +1,57 @@
-//! krun-backend：DSH krun 沙盒的 VM 运行时守护进程。
+//! krun-backend：DSH krun 沙盒的 VM 运行时。
 //!
 //! 子命令：
 //! - `probe`                     检查 libkrun 特性（INIT_BLOB/NET/BLK）与 /dev/kvm
 //! - `boot`                      引导对齐冒烟：等价官方 chroot_vm 示例（进程随工作负载退出）
-//! - `serve --socket <path>`     守护进程模式（UNIX socket 上的 JSON 行协议；方法集后续里程碑实现）
+//! - `serve --socket <path>`     会话守护进程：注册表 + boot 子进程监督 + 端口转发监听
+//!                               + 空闲回收执行（见 serve.rs；设计 §4.1）
+//! - `exec`                      agent 客户端（数据面直连 agent.sock，不过守护进程）
 
 mod api;
+mod serve;
 
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixListener;
+use std::io::Write as IoWrite;
 use std::process::ExitCode;
+
+/// PDEATHSIG：父进程（守护进程/dsh）死亡时回收本进程——崩溃不留孤儿 VM。
+fn set_parent_death_signal() {
+    const PR_SET_PDEATHSIG: libc::c_int = 1;
+    const SIGTERM: libc::c_int = 15;
+    unsafe { libc::prctl(PR_SET_PDEATHSIG, SIGTERM, 0, 0, 0) };
+}
+
+fn main() -> ExitCode {
+    set_parent_death_signal();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("probe") => cmd_probe(),
+        Some("boot") => cmd_boot(&args[1..]),
+        Some("exec") => cmd_exec(&args[1..]),
+        Some("serve") => {
+            let mut socket = None;
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--socket" => { socket = Some(args.get(i + 1).expect("--socket needs a value").clone()); i += 2; }
+                    other => { eprintln!("serve: unknown option {other}"); usage(); }
+                }
+            }
+            let socket = socket.unwrap_or_else(|| { eprintln!("serve: --socket is required"); usage() });
+            serve::run(&socket)
+        }
+        _ => usage(),
+    }
+}
 
 fn usage() -> ! {
     eprintln!("usage: krun-backend <probe|boot|exec|serve> [options]");
     eprintln!("  probe");
     eprintln!("  boot --rootfs <p> [--console <f>] [--vcpus <n>] [--ram <mib>] [--agent-sock <p>] [--setup ro|rw] [--ws-path <p>] [--data-img <p>] [--data-format raw|qcow2] [--network tsi|none] [--port-map host:guest] [--forward host:guest] -- <command...>");
     eprintln!("    --forward host:guest  应用层端口转发（重复可叠）：额外 vsock 端口桥接 UNIX socket（<agent-sock>.fwd<N>），");
-    eprintln!("                          agent 中继到 guest 127.0.0.1:<guest>；宿主侧由 provider 起 TCP 监听（none 档零占用组合）");
+    eprintln!("                          agent 中继到 guest 127.0.0.1:<guest>；宿主侧由 provider/serve 起 TCP 监听（none 档零占用组合）");
     eprintln!("  exec --socket <p> [--cwd <d>] -- <argv...>");
-    eprintln!("  serve --socket <path>");
+    eprintln!("  serve --socket <path>  会话守护进程（注册表/监督/gc/转发监听；协议见 serve.rs 模块头）");
     std::process::exit(2);
-}
-
-fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.first().map(String::as_str) {
-        Some("probe") => cmd_probe(),
-        Some("boot") => cmd_boot(&args[1..]),
-        Some("exec") => cmd_exec(&args[1..]),
-        Some("serve") => cmd_serve(&args[1..]),
-        _ => usage(),
-    }
 }
 
 /// exec 客户端：直连会话的 agent socket（VMM 监听桥接到 guest vsock），不过守护进程。
@@ -332,33 +353,4 @@ fn cmd_boot(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// 守护进程骨架：绑定 UNIX socket，逐行读取 JSON 请求。M0.2 只回显/探活，
-/// 方法集（session.ensure/stop/list、terminal.open）在后续里程碑实现。
-fn cmd_serve(args: &[String]) -> ExitCode {
-    let mut socket = None;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--socket" => { socket = Some(args.get(i + 1).expect("--socket needs a value").clone()); i += 2; }
-            other => { eprintln!("serve: unknown option {other}"); usage(); }
-        }
-    }
-    let socket = socket.unwrap_or_else(|| { eprintln!("serve: --socket is required"); usage(); });
 
-    let _ = std::fs::remove_file(&socket); // 清理陈旧 socket
-    let listener = UnixListener::bind(&socket).expect("bind control socket");
-    eprintln!("krun-backend serve: listening on {socket}");
-    for stream in listener.incoming() {
-        let mut stream = match stream { Ok(s) => s, Err(e) => { eprintln!("accept: {e}"); continue; } };
-        let mut reader = BufReader::new(stream.try_clone().expect("try_clone"));
-        let mut line = String::new();
-        if reader.read_line(&mut line).is_err() { continue; }
-        let reply = if line.contains("\"ping\"") {
-            "{\"ok\":true,\"result\":{\"version\":\"0.1.0\",\"kind\":\"krun-backend\"}}"
-        } else {
-            "{\"ok\":false,\"err\":\"not_implemented\"}"
-        };
-        let _ = writeln!(stream, "{reply}");
-    }
-    ExitCode::SUCCESS
-}

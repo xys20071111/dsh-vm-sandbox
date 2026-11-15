@@ -696,6 +696,7 @@ dependencies = [
 name = "krun-backend"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "libkrun",
  "serde",
  "serde_json",

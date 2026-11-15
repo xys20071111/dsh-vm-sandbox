@@ -271,6 +271,10 @@ export class KrunSandboxProvider extends SandboxProvider {
     /** 数据层盘格式：raw（ext4 稀疏盘，经典路径）/ qcow2（快照/克隆友好，需宿主 qemu-img，
      *  首次启动由 guest 内格式化）。 */
     dataDiskFormat: z.union([z.const('raw'), z.const('qcow2')]).default('raw'),
+    /** 会话守护进程（serve）：注册表 + boot 子进程监督 + gc/转发监听。true = provider 经
+     *  UNIX socket JSON 行协议调用（跨进程共享会话，live/headless 同 dataDir 共用一 VM）；
+     *  false = 遗留直 spawn boot 路径。 */
+    daemon: z.boolean().default(true),
   });
 
   /** 诊断标记：追加到 <dataDir>/diag.log（激活/路由排查用；一次性手段，收敛后移除）。 */
@@ -357,7 +361,7 @@ export class KrunSandboxProvider extends SandboxProvider {
       },
       sessions: [...this.sessions.values()].map((s) => ({
         key: s.key, ws: s.ws, mode: s.mode, image: s.image,
-        alive: !s.child.killed,
+        alive: s.daemonManaged ? true : !s.child.killed,
         uptimeMs: Date.now() - (s.startedAt ?? Date.now()),
         idleMs: Date.now() - (s.lastUse ?? Date.now()),
       })),
@@ -384,6 +388,7 @@ export class KrunSandboxProvider extends SandboxProvider {
       path: '/api/krun/status',
       handler: async (req, res) => {
         if (req.method !== 'GET') { res.writeHead(405); res.end(); return; }
+        await this.krunRefreshSessions().catch(() => {});
         sendJson(res, 200, this.krunStatusSnapshot());
       },
     }, 'krun-vm: GET /api/krun/status');
@@ -393,9 +398,9 @@ export class KrunSandboxProvider extends SandboxProvider {
       handler: async (req, res) => {
         if (req.method !== 'POST') { res.writeHead(405); res.end(); return; }
         const body = await readBody(req);
-        const s = this.sessions.get(String(body.key ?? ''));
-        if (!s) { sendJson(res, 404, { ok: false, err: 'unknown session key' }); return; }
-        s.child.kill('SIGTERM');
+        await this.krunRefreshSessions().catch(() => {});
+        const stopped = await this.krunStopSession(String(body.key ?? ''));
+        if (!stopped) { sendJson(res, 404, { ok: false, err: 'unknown session key' }); return; }
         sendJson(res, 200, { ok: true });
       },
     }, 'krun-vm: POST /api/krun/stop');
@@ -530,7 +535,7 @@ export class KrunSandboxProvider extends SandboxProvider {
       handler: async (req, res) => {
         if (req.method !== 'POST') { res.writeHead(405); res.end(); return; }
         const body = await readBody(req);
-        sendJson(res, 200, this.krunResetWorkspaceData(String(body.ws ?? '')));
+        sendJson(res, 200, await this.krunResetWorkspaceData(String(body.ws ?? '')));
       },
     }, 'krun-vm: POST /api/krun/workspaces/reset');
   }
@@ -595,14 +600,13 @@ export class KrunSandboxProvider extends SandboxProvider {
   }
 
   /** 丢弃工作区数据层（容器级重置）：停会话 + 删数据盘。user-only 破坏类操作。 */
-  krunResetWorkspaceData(ws) {
+  async krunResetWorkspaceData(ws) {
     if (!ws.startsWith('/')) return { ok: false, err: 'ws must be an absolute path' };
     const stopped = [];
     const removed = [];
     for (const [key, s] of [...this.sessions]) {
       if (s.ws !== ws) continue;
-      s.child.kill('SIGTERM');
-      this.sessions.delete(key);
+      await this.krunStopSession(key);
       stopped.push(`${key}(${s.mode})`);
     }
     for (const mode of ['ro', 'rw']) {
@@ -648,6 +652,7 @@ export class KrunSandboxProvider extends SandboxProvider {
   }
 
   async krunVmStatusText(invocation) {
+    await this.krunRefreshSessions().catch(() => {});
     const lines = [];
     const probe = this.krunProbeCache ?? await this.probe();
     lines.push(`环境：${probe.ok ? '可用' : `不可用（${probe.detail}）`}`);
@@ -678,7 +683,8 @@ export class KrunSandboxProvider extends SandboxProvider {
     return lines.join('\n');
   }
 
-  krunVmStop(filter) {
+  async krunVmStop(filter) {
+    await this.krunRefreshSessions().catch(() => {});
     const targets = [...this.sessions.values()].filter((s) => {
       if (!filter || filter === 'all') return true;
       if (filter === 'ro' || filter === 'rw') return s.mode === filter;
@@ -686,8 +692,7 @@ export class KrunSandboxProvider extends SandboxProvider {
     });
     if (targets.length === 0) return { kind: 'error', text: `无匹配会话（${filter ?? 'all'}）；当前 ${this.sessions.size} 个` };
     for (const s of targets) {
-      s.child.kill('SIGTERM');
-      this.sessions.delete(s.key);
+      await this.krunStopSession(s.key);
     }
     return { kind: 'success', text: `已停止 ${targets.length} 个会话：${targets.map((s) => `${s.key}(${s.mode})`).join(', ')}` };
   }
@@ -735,11 +740,18 @@ export class KrunSandboxProvider extends SandboxProvider {
   }
 
   /** 空闲回收：无活跃终端/连接且超过 idleStopMs 的会话优雅停机（数据层天然落盘）。
-   *  活跃连接判定：liveTerminals（本 provider 的终端）∪ agent stat（exec/term/fwd 连接，
-   *  覆盖 run_in_background 长驻子进程与端口转发连接，设计 §7"无活动连接"语义）。 */
+   *  daemon 模式：gc 在守护进程执行（stat 覆盖全部客户端的 exec/term/fwd 连接），
+   *  响应的 stopped 键同步修剪本地缓存；legacy 模式：本方法自管（agent stat 探测）。 */
   async krunGcIdle() {
     const idle = this.krunConfig.idleStopMs ?? 600000;
     if (!idle) return;
+    if (this.krunConfig.daemon ?? true) {
+      const reply = await this.krunDaemonCall('session.gc', { idleMs: idle }).catch(() => null);
+      if (reply?.ok) {
+        for (const key of reply.stopped ?? []) this.sessions.delete(key);
+      }
+      return;
+    }
     const now = Date.now();
     for (const [key, s] of [...this.sessions]) {
       if ((s.liveTerminals ?? 0) > 0) continue;
@@ -797,6 +809,131 @@ export class KrunSandboxProvider extends SandboxProvider {
     } catch { /* 宿主无 resolv.conf 时跳过 */ }
   }
 
+  /** 会话守护进程连接（懒建；失败重 spawn，ping 为就绪判据）。单连接 + 调用串行队列。 */
+  krunDaemonSocket() {
+    return join(this.krunDataDir, 'daemon.sock');
+  }
+
+  async krunDaemonConn() {
+    if (this.krunDaemon) return this.krunDaemon.conn;
+    const sockPath = this.krunDaemonSocket();
+    const pingOnce = () => new Promise((res) => {
+      const s = netConnect({ path: sockPath }, () => {
+        s.write(`${JSON.stringify({ method: 'ping' })}\n`);
+      });
+      let buf = '';
+      const timer = setTimeout(() => { s.destroy(); res(false); }, 1500);
+      s.on('data', (d) => {
+        buf += typeof d === 'string' ? d : d.toString('utf8');
+        if (buf.includes('"krun-backend-serve"')) { clearTimeout(timer); s.destroy(); res(true); }
+      });
+      s.on('error', () => { clearTimeout(timer); s.destroy(); res(false); });
+    });
+    const spawnDaemon = () => new Promise((res) => {
+      const env = { ...process.env };
+      const libDir = expandHome(this.krunConfig.libDir);
+      if (libDir) env.LD_LIBRARY_PATH = libDir;
+      const child = spawn(this.krunBackendPath, ['serve', '--socket', sockPath], {
+        env,
+        stdio: 'ignore',
+        detached: true,
+      });
+      child.unref();
+      this.krunDiag(`daemon spawned pid=${child.pid}`);
+      res(child);
+    });
+    const deadline = Date.now() + 8000;
+    let spawned = false;
+    while (Date.now() < deadline) {
+      if (await pingOnce()) break;
+      if (!spawned) {
+        spawned = true;
+        await spawnDaemon();
+      }
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    if (!(await pingOnce())) {
+      throw new Error(`krun daemon not reachable at ${sockPath}`);
+    }
+    const conn = netConnect({ path: sockPath });
+    await new Promise((res, rej) => {
+      conn.once('connect', res);
+      conn.once('error', rej);
+    });
+    this.krunDaemon = { conn };
+    conn.on('error', () => { if (this.krunDaemon?.conn === conn) this.krunDaemon = null; });
+    conn.on('close', () => { if (this.krunDaemon?.conn === conn) this.krunDaemon = null; });
+    this.krunDiag('daemon connected');
+    return conn;
+  }
+
+  /** 守护进程调用（串行队列：单连接上一问一答，严格有序）。 */
+  krunDaemonCall(method, params) {
+    const run = async () => {
+      const conn = await this.krunDaemonConn();
+      return new Promise((res, rej) => {
+        let buf = '';
+        const onData = (d) => {
+          buf += typeof d === 'string' ? d : d.toString('utf8');
+          const nl = buf.indexOf('\n');
+          if (nl < 0) return;
+          conn.removeListener('data', onData);
+          try { res(JSON.parse(buf.slice(0, nl))); } catch (e) { rej(e); }
+        };
+        const onErr = (e) => {
+          conn.removeListener('data', onData);
+          if (this.krunDaemon?.conn === conn) this.krunDaemon = null;
+          rej(e);
+        };
+        conn.on('data', onData);
+        conn.once('error', onErr);
+        conn.write(`${JSON.stringify({ method, params })}\n`);
+      });
+    };
+    this.krunDaemonChain = (this.krunDaemonChain ?? Promise.resolve()).then(run, run);
+    return this.krunDaemonChain;
+  }
+
+  /** 会话停止（按模式路由：daemon → session.stop；legacy → child.kill）。 */
+  async krunStopSession(key) {
+    const s = this.sessions.get(key);
+    if (s?.daemonManaged) {
+      const reply = await this.krunDaemonCall('session.stop', { key }).catch((e) => ({ ok: false, err: String(e) }));
+      this.sessions.delete(key);
+      return Boolean(reply.ok);
+    }
+    if (s) {
+      s.child.kill('SIGTERM');
+      this.sessions.delete(key);
+      return true;
+    }
+    return false;
+  }
+
+  /** 守护进程会话清单 → 本地缓存重建（daemon 为准；保留终端计数）。 */
+  async krunRefreshSessions() {
+    if (!(this.krunConfig.daemon ?? true)) return;
+    const reply = await this.krunDaemonCall('session.list', {}).catch(() => null);
+    if (!reply?.ok) return;
+    const fresh = new Map();
+    for (const s of reply.sessions ?? []) {
+      fresh.set(s.key, {
+        key: s.key,
+        child: null,
+        agentSock: s.agentSock,
+        ws: s.ws,
+        mode: s.mode,
+        image: s.image,
+        startedAt: Date.now() - (s.uptimeMs ?? 0),
+        lastUse: Date.now() - (s.idleMs ?? 0),
+        liveTerminals: this.sessions.get(s.key)?.liveTerminals ?? 0,
+        daemonManaged: true,
+        forwards: s.forwards ?? 0,
+      });
+    }
+    this.sessions = fresh;
+  }
+
   async waitForAgent(sockPath, timeoutMs, signal) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
@@ -835,14 +972,23 @@ export class KrunSandboxProvider extends SandboxProvider {
     const pending = this.booting.get(key);
     if (pending) return pending;
 
-    const boot = this.bootSession({ key, ws, mode, policy }, signal).catch((err) => {
-      this.booting.delete(key);
-      throw err;
-    });
+    const boot = this.bootSession({ key, ws, mode, policy }, signal)
+      .then((session) => {
+        // 缓存统一在 ensureSession 落账（daemon/legacy 两条引导路径共用）；
+        // 单飞记录清除——否则 gc 回收后同 key 永远拿到已死的 boot promise
+        this.sessions.set(key, session);
+        this.booting.delete(key);
+        return session;
+      })
+      .catch((err) => {
+        this.booting.delete(key);
+        throw err;
+      });
     this.booting.set(key, boot);
     return boot;
   }
 
+  /** 惰性引导一个会话；同 key 并发共享单次启动（daemon 模式下单飞在守护进程内）。 */
   async bootSession({ key, ws, mode, policy }, signal) {
     const probe = await this.probe();
     if (!probe.ok) throw new SandboxUnavailableError(policy.mode, `krun VM unavailable — ${probe.detail}`);
@@ -859,6 +1005,73 @@ export class KrunSandboxProvider extends SandboxProvider {
       if (pkgs.warning) this.krunDiag(`guest pkgs warning: ${pkgs.warning}`);
     }
 
+    if (this.krunConfig.daemon ?? true) {
+      return this.bootSessionViaDaemon({ key, ws, mode, policy }, imageRootfs);
+    }
+    return this.bootSessionDirect({ key, ws, mode, policy }, imageRootfs, signal);
+  }
+
+  /** daemon 模式：引导委托给 serve 守护进程（会话注册表/监督/gc/转发监听都在那边）。 */
+  async bootSessionViaDaemon({ key, ws, mode, policy }, imageRootfs) {
+    const runDir = join(this.krunDataDir, 'run');
+    const logDir = join(this.krunDataDir, 'logs');
+    const sockPath = join(runDir, `${key}.sock`);
+    const logPath = join(logDir, `${key}.log`);
+    const dataImg = mode === 'rw' ? join(this.krunDataDir, 'workspaces', `${key}.img`) : undefined;
+    const forwards = (this.krunConfig.portMap ?? []).map((entry) => {
+      const [host, guest] = String(entry).split(':').map((v) => Number.parseInt(v, 10));
+      if (!Number.isInteger(host) || !Number.isInteger(guest)) {
+        throw new SandboxUnavailableError(policy.mode, `invalid portMap entry ${entry} (expect host:guest)`);
+      }
+      return { host, guest };
+    });
+    const fingerprint = createHash('sha1')
+      .update(JSON.stringify({
+        image: imageRootfs,
+        vcpus: this.krunConfig.resources.vcpus,
+        ram: this.krunConfig.resources.ramMib,
+        network: this.krunConfig.network,
+        portMap: this.krunConfig.portMap ?? [],
+        dataFormat: this.krunConfig.dataDiskFormat ?? 'raw',
+        dataImg,
+      }))
+      .digest('hex')
+      .slice(0, 16);
+    const reply = await this.krunDaemonCall('session.ensure', {
+      key, ws, mode,
+      image: imageRootfs,
+      vcpus: this.krunConfig.resources.vcpus,
+      ram: this.krunConfig.resources.ramMib,
+      network: this.krunConfig.network,
+      dataImg,
+      dataFormat: this.krunConfig.dataDiskFormat ?? 'raw',
+      agentSock: sockPath,
+      logPath,
+      forwards,
+      fingerprint,
+    }).catch((err) => ({ ok: false, err: `daemon call failed: ${err?.message ?? err}` }));
+    if (!reply.ok) {
+      throw new SandboxUnavailableError(policy.mode, `krun session boot failed — ${reply.err}; log: ${logPath}`);
+    }
+    this.krunDiag(`daemon session ${reply.reused ? 'reused' : 'booted'} key=${key}`);
+    return {
+      key,
+      child: null,
+      agentSock: sockPath,
+      ws,
+      mode,
+      image: imageRootfs,
+      logPath,
+      lastUse: Date.now(),
+      startedAt: Date.now(),
+      liveTerminals: 0,
+      daemonManaged: true,
+      forwards: reply.session?.forwards ?? 0,
+    };
+  }
+
+  /** 遗留直 spawn 路径（daemon:false）：一 VM 一子进程，provider 自管注册表/转发监听。 */
+  async bootSessionDirect({ key, ws, mode, policy }, imageRootfs, signal) {
     const runDir = join(this.krunDataDir, 'run');
     const logDir = join(this.krunDataDir, 'logs');
     const sockPath = join(runDir, `${key}.sock`);
@@ -935,16 +1148,24 @@ export class KrunSandboxProvider extends SandboxProvider {
       });
       session.fwdServers.push(srv);
     }
-    this.sessions.set(key, session);
     this.booting.delete(key);
     return session;
   }
 
-  stopAll() {
+  /** disposer（插件卸载/HMR）：停全部会话并关停守护进程（§7——数据层天然落盘，
+   *  重启后由持久数据层恢复）。legacy 会话 child.kill 直停。 */
+  async stopAll() {
     for (const [, s] of this.sessions) {
+      if (s.daemonManaged) continue; // daemon 会话由 shutdown 统一停
       s.child.kill('SIGTERM');
     }
     this.sessions.clear();
+    if (this.krunDaemon) {
+      try {
+        await this.krunDaemonCall('shutdown', {});
+      } catch { /* 连接已断 = 守护进程已退出 */ }
+      this.krunDaemon = null;
+    }
   }
 
   /** sandbox 接缝：把 argv 包装为 krun-exec 客户端调用。 */
@@ -958,6 +1179,10 @@ export class KrunSandboxProvider extends SandboxProvider {
     // 返回的 argv（LocalBashExecutor: cwd: spec.workdir），命令 cwd 由 krun-backend
     // exec 客户端以自身 getcwd() 取得——工作区在 guest 内挂同绝对路径，无需映射。
     session.lastUse = Date.now();
+    if (session.daemonManaged) {
+      // 守护进程侧计时同步（fire-and-forget；gc 据此 + agent stat 判定空闲）
+      this.krunDaemonCall('session.touch', { key: session.key }).catch(() => {});
+    }
     return {
       argv: [
         this.krunBackendPath,
