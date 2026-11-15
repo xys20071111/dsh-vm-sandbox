@@ -167,7 +167,7 @@ krun_start_enter(ctx);                      // 阻塞至 VM 关闭
 | `none` | `krun_disable_implicit_vsock()` + `krun_add_vsock(0)`（保留 vsock 但关闭 TSI 劫持） | 严格隔离；控制通道不受影响 |
 | `portMap`（任意档位叠加） | **应用层端口转发（2026-11-15 实现，替代 1.19.x 改名映射）**：每条 `host:guest` 配一个额外 vsock 端口（4200 起），VMM 桥接 `run/<key>.fwd<vsock>.sock`，agent（`DSH_FORWARD_PORTS`）中继到 guest `127.0.0.1:<guest>`；provider 在宿主监听 `127.0.0.1:<host>` → 该 socket。`none` 档下即"零宿主端口占用 + 只暴露指定端口"组合；转发连接计入 stat `fwdConns`（免于空闲回收） | 显式白名单式暴露 |
 
-安全注记：libkrun 官方安全模型明确"VM 边界不限制通过设备暴露的宿主资源"，TSI 使用 VMM 的宿主网络权限——因此 `network: 'none'` 是唯一网络级隔离档位（`portMap` 转发是显式开的孔），文档必须如实说明（文件效果词汇不覆盖网络，这与 DSH 沙盒模式语义一致）。
+**按工作区覆盖（2026-11-15）**：网络档不随全局一刀切——工作区绑定（registry.json）可带 `network: tsi|none`，boot 解析顺序 = 绑定值 → 全局默认；管理页绑定卡与 `/api/krun/workspaces/network` 可设置，档位进会话指纹，变化即停旧启新（下次会话重建生效）。安全注记：libkrun 官方安全模型明确"VM 边界不限制通过设备暴露的宿主资源"，TSI 使用 VMM 的宿主网络权限——因此 `network: 'none'` 是唯一网络级隔离档位（`portMap` 转发是显式开的孔），文档必须如实说明（文件效果词汇不覆盖网络，这与 DSH 沙盒模式语义一致）。
 
 ### 4.4 运行时依赖与安装
 
@@ -597,6 +597,12 @@ qcow2 数据层（guest 内首启格式化 + 持久化）；侧栏终端桥（�
   内容：结构化错误 → probe → boot log（会话键公式 + 常见结尾表）→ dump-config → headless
   冒烟 → 意图核对（空闲回收/网络档/侧栏接缝）→ 破坏类操作 user-only。headless diag
   全链验证（`registered diagnose-krun-vm-sandbox`）+ 限制命令回归通过。
+- **网络档按工作区覆盖（用户需求）**：绑定注册表条目带 `network: tsi|none`（管理页绑定卡
+  选择器 + `POST /api/krun/workspaces/network`，`''` 清除恢复全局默认）；boot 解析 =
+  `krunWorkspaceSettings(ws)`（绑定值 → 全局默认），网络进会话指纹——档位变化经指纹漂移
+  停旧启新。设置路由同步失效本实例会话缓存（下次 ensure 重新比对指纹）。实测：全局 none +
+  覆盖 tsi → guest wget 拉回 example.com ✓；覆盖 none → 出站隔离 ✓；缓存条目带生效档位
+  （管理页会话行显示）。生效时机 = 下次会话（重）建，其他客户端的既有会话待其自身重建。
 - **工作区归属映射验证（用户问询驱动）**：guest root `touch <ws>/f` → 宿主归属 = harness
   用户（VMM 凭据），**非 root**；guest 侧 `ls` 见宿主真实 uid（1000:1000）；guest 内建
   uid1000 用户后 `su -c 'touch <ws>/f2'` 直写成功（rc=0），宿主归属同样正确。结论：无

@@ -361,6 +361,7 @@ export class KrunSandboxProvider extends SandboxProvider {
       },
       sessions: [...this.sessions.values()].map((s) => ({
         key: s.key, ws: s.ws, mode: s.mode, image: s.image,
+        network: s.network ?? this.krunConfig.network,
         alive: s.daemonManaged ? true : !s.child.killed,
         uptimeMs: Date.now() - (s.startedAt ?? Date.now()),
         idleMs: Date.now() - (s.lastUse ?? Date.now()),
@@ -509,12 +510,41 @@ export class KrunSandboxProvider extends SandboxProvider {
           return;
         }
         const reg = REGISTRY.read(this.krunDataDir);
-        reg.workspaces[ws] = { imageId, boundAt: new Date().toISOString() };
+        const entry = { imageId, boundAt: new Date().toISOString() };
+        const net = body.network === 'tsi' || body.network === 'none' ? body.network : undefined;
+        if (net) entry.network = net;
+        reg.workspaces[ws] = entry;
         REGISTRY.write(this.krunDataDir, reg);
-        this.krunDiag(`bind ${ws} -> ${imageId}`);
+        this.krunInvalidateWsCache(ws);
+        this.krunDiag(`bind ${ws} -> ${imageId}${net ? ` (network ${net})` : ''}`);
         sendJson(res, 200, { ok: true });
       },
     }, 'krun-vm: POST /api/krun/workspaces/bind');
+    registerRoute({
+      kind: 'exact',
+      path: '/api/krun/workspaces/network',
+      handler: async (req, res) => {
+        if (req.method !== 'POST') { res.writeHead(405); res.end(); return; }
+        const body = await readBody(req);
+        const ws = String(body.ws ?? '');
+        const net = body.network;
+        if (!ws.startsWith('/')) { sendJson(res, 400, { ok: false, err: 'ws must be an absolute path' }); return; }
+        if (net !== 'tsi' && net !== 'none' && net !== null && net !== '') {
+          sendJson(res, 400, { ok: false, err: "network must be tsi|none|'' (clear)" });
+          return;
+        }
+        const reg = REGISTRY.read(this.krunDataDir);
+        if (net === 'tsi' || net === 'none') {
+          reg.workspaces[ws] = { ...(reg.workspaces[ws] ?? { imageId: null, boundAt: new Date().toISOString() }), network: net };
+        } else if (reg.workspaces[ws]) {
+          delete reg.workspaces[ws].network; // 恢复全局默认
+        }
+        REGISTRY.write(this.krunDataDir, reg);
+        this.krunInvalidateWsCache(ws);
+        this.krunDiag(`workspace network ${ws} -> ${net || '(default)'}`);
+        sendJson(res, 200, { ok: true });
+      },
+    }, 'krun-vm: POST /api/krun/workspaces/network');
     registerRoute({
       kind: 'exact',
       path: '/api/krun/workspaces/unbind',
@@ -671,7 +701,10 @@ export class KrunSandboxProvider extends SandboxProvider {
     const wsKeys = Object.keys(reg.workspaces);
     if (wsKeys.length > 0) {
       lines.push(`工作区绑定：${wsKeys.length} 个`);
-      for (const ws of wsKeys) lines.push(`  - ${ws} → ${reg.workspaces[ws].imageId}`);
+      for (const ws of wsKeys) {
+        const b = reg.workspaces[ws];
+        lines.push(`  - ${ws} → ${b.imageId}${b.network ? `（网络 ${b.network}）` : '（网络默认）'}`);
+      }
     }
     if (invocation) {
       try {
@@ -763,6 +796,25 @@ export class KrunSandboxProvider extends SandboxProvider {
       }
       s.child.kill('SIGTERM');
       this.sessions.delete(key);
+    }
+  }
+
+  /** 工作区生效配置：镜像（绑定 → imageRootfs）+ 网络档（绑定 network → 全局默认）。
+   *  网络按工作区覆盖是用户显式设置（设计 §10 workspaces[]），不走全局一刀切。 */
+  krunWorkspaceSettings(ws) {
+    const binding = REGISTRY.read(this.krunDataDir).workspaces[ws];
+    const network = binding?.network === 'tsi' || binding?.network === 'none'
+      ? binding.network
+      : this.krunConfig.network;
+    const image = this.krunResolveImage(ws);
+    return { image, network, binding };
+  }
+
+  /** 工作区设置变更后失效本实例的会话缓存：下次 ensure 重新走指纹比对，
+   *  档位/镜像变化的会话由守护进程停旧启新。 */
+  krunInvalidateWsCache(ws) {
+    for (const mode of ['ro', 'rw']) {
+      this.sessions.delete(sessionKey(ws, mode));
     }
   }
 
@@ -924,6 +976,7 @@ export class KrunSandboxProvider extends SandboxProvider {
         ws: s.ws,
         mode: s.mode,
         image: s.image,
+        network: this.krunWorkspaceSettings(s.ws).network,
         startedAt: Date.now() - (s.uptimeMs ?? 0),
         lastUse: Date.now() - (s.idleMs ?? 0),
         liveTerminals: this.sessions.get(s.key)?.liveTerminals ?? 0,
@@ -1005,14 +1058,16 @@ export class KrunSandboxProvider extends SandboxProvider {
       if (pkgs.warning) this.krunDiag(`guest pkgs warning: ${pkgs.warning}`);
     }
 
+    const { network } = this.krunWorkspaceSettings(ws);
     if (this.krunConfig.daemon ?? true) {
-      return this.bootSessionViaDaemon({ key, ws, mode, policy }, imageRootfs);
+      return this.bootSessionViaDaemon({ key, ws, mode, policy }, imageRootfs, network);
     }
-    return this.bootSessionDirect({ key, ws, mode, policy }, imageRootfs, signal);
+    return this.bootSessionDirect({ key, ws, mode, policy }, imageRootfs, signal, network);
   }
 
-  /** daemon 模式：引导委托给 serve 守护进程（会话注册表/监督/gc/转发监听都在那边）。 */
-  async bootSessionViaDaemon({ key, ws, mode, policy }, imageRootfs) {
+  /** daemon 模式：引导委托给 serve 守护进程（会话注册表/监督/gc/转发监听都在那边）。
+   *  network = 工作区覆盖档位（krunWorkspaceSettings），进指纹——档位变化自动停旧启新。 */
+  async bootSessionViaDaemon({ key, ws, mode, policy }, imageRootfs, network) {
     const runDir = join(this.krunDataDir, 'run');
     const logDir = join(this.krunDataDir, 'logs');
     const sockPath = join(runDir, `${key}.sock`);
@@ -1030,7 +1085,7 @@ export class KrunSandboxProvider extends SandboxProvider {
         image: imageRootfs,
         vcpus: this.krunConfig.resources.vcpus,
         ram: this.krunConfig.resources.ramMib,
-        network: this.krunConfig.network,
+        network,
         portMap: this.krunConfig.portMap ?? [],
         dataFormat: this.krunConfig.dataDiskFormat ?? 'raw',
         dataImg,
@@ -1042,7 +1097,7 @@ export class KrunSandboxProvider extends SandboxProvider {
       image: imageRootfs,
       vcpus: this.krunConfig.resources.vcpus,
       ram: this.krunConfig.resources.ramMib,
-      network: this.krunConfig.network,
+      network,
       dataImg,
       dataFormat: this.krunConfig.dataDiskFormat ?? 'raw',
       agentSock: sockPath,
@@ -1061,6 +1116,7 @@ export class KrunSandboxProvider extends SandboxProvider {
       ws,
       mode,
       image: imageRootfs,
+      network,
       logPath,
       lastUse: Date.now(),
       startedAt: Date.now(),
@@ -1071,7 +1127,7 @@ export class KrunSandboxProvider extends SandboxProvider {
   }
 
   /** 遗留直 spawn 路径（daemon:false）：一 VM 一子进程，provider 自管注册表/转发监听。 */
-  async bootSessionDirect({ key, ws, mode, policy }, imageRootfs, signal) {
+  async bootSessionDirect({ key, ws, mode, policy }, imageRootfs, signal, network) {
     const runDir = join(this.krunDataDir, 'run');
     const logDir = join(this.krunDataDir, 'logs');
     const sockPath = join(runDir, `${key}.sock`);
@@ -1096,7 +1152,7 @@ export class KrunSandboxProvider extends SandboxProvider {
       mkdirSync(dirname(img), { recursive: true });
       confineArgs.push('--data-img', img);
     }
-    if (this.krunConfig.network === 'none') confineArgs.push('--network', 'none');
+    if (network === 'none') confineArgs.push('--network', 'none');
     for (const pm of this.krunConfig.portMap ?? []) confineArgs.push('--forward', pm);
     if ((this.krunConfig.dataDiskFormat ?? 'raw') === 'qcow2') confineArgs.push('--data-format', 'qcow2');
 

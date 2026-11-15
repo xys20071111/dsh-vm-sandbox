@@ -20,8 +20,9 @@
   内置已测预设（alpine-minirootfs 3.22、ubuntu-base 24.04）
 - **侧栏终端**：GUI"新建终端"shell 选择器里的 `krun` 项（`plugin/bin/krun` 桥，
   OSC 7777 resize 直达 guest PTY，会话未运行自动引导）
-- **端口转发**：`portMap: ["host:guest"]` = vsock 应用层转发（宿主绑 127.0.0.1），
-  `network: none` 档下即"零占用 + 只暴露指定端口"组合
+- **网络档按工作区**：全局默认 + 工作区绑定覆盖（tsi/none，管理页选择器/`workspaces/network` API），
+  档位变化自动停旧启新；`portMap: ["host:guest"]` = vsock 应用层转发（宿主绑 127.0.0.1），
+  `none` 档下即"零占用 + 只暴露指定端口"组合
 - **qcow2 数据层**：`dataDiskFormat: 'qcow2'`（qemu-img 建盘，guest 内首启格式化）
 - **诊断 skill**：`diagnose-krun-vm-sandbox`（全局 skill，排障路径 + 常见失败表）
 - **会话守护进程**：`serve`（默认开启，`daemon: false` 回退直 spawn）——跨进程共享会话

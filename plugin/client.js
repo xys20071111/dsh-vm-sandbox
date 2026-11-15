@@ -97,17 +97,26 @@ window.__ModuleLoader__.load({
     function BindForm({ images, onMsg, refresh }) {
       const [ws, setWs] = React.useState('');
       const [imageId, setImageId] = React.useState('');
+      const [network, setNetwork] = React.useState('');
       const submit = async () => {
-        const r = await postJson('/api/krun/workspaces/bind', { ws, imageId });
-        onMsg(r.ok ? `已绑定 ${ws} → ${imageId}` : `绑定失败：${r.err ?? r.status}`);
+        const r = await postJson('/api/krun/workspaces/bind', { ws, imageId, network: network || undefined });
+        onMsg(r.ok ? `已绑定 ${ws} → ${imageId}${network ? `（网络 ${network}）` : ''}` : `绑定失败：${r.err ?? r.status}`);
         refresh();
       };
-      return h('div', { className: 'krun-row' },
-        h('input', { className: 'krun-input', placeholder: '/工作区/绝对路径', value: ws, onChange: (e) => setWs(e.target.value) }),
-        h('select', { className: 'krun-btn', value: imageId, onChange: (e) => setImageId(e.target.value) },
-          h('option', { value: '' }, '选择镜像…'),
-          images.map((im) => h('option', { key: im.id, value: im.id }, `${im.name} (${im.id})`))),
-        h('button', { className: 'krun-btn', onClick: submit, disabled: !ws || !imageId }, '绑定'));
+      return h('div', null,
+        h('div', { className: 'krun-row' },
+          h('input', { className: 'krun-input', placeholder: '/工作区/绝对路径', value: ws, onChange: (e) => setWs(e.target.value) }),
+          h('select', { className: 'krun-btn', value: imageId, onChange: (e) => setImageId(e.target.value) },
+            h('option', { value: '' }, '选择镜像…'),
+            images.map((im) => h('option', { key: im.id, value: im.id }, `${im.name} (${im.id})`))),
+          h('button', { className: 'krun-btn', onClick: submit, disabled: !ws || !imageId }, '绑定')),
+        h('div', { className: 'krun-row krun-muted' },
+          h('span', null, '网络档：'),
+          h('select', { className: 'krun-btn', value: network, onChange: (e) => setNetwork(e.target.value) },
+            h('option', { value: '' }, '跟随全局默认'),
+            h('option', { value: 'tsi' }, 'tsi（共享宿主网络）'),
+            h('option', { value: 'none' }, 'none（隔离）')),
+          h('span', null, '档位变化在下次会话（重）建时生效')));
     }
 
     function ManagementPage() {
@@ -172,7 +181,7 @@ window.__ModuleLoader__.load({
           sessions.length === 0
             ? h('div', { className: 'krun-muted' }, '无（惰性启动：首个受限命令时创建）')
             : sessions.map((s) => h('div', { className: 'krun-row', key: s.key },
-                h('span', null, `${s.mode} · ${s.ws}`),
+                h('span', null, `${s.mode} · 网络 ${s.network ?? '默认'} · ${s.ws}`),
                 h('span', null,
                   `${Math.round(s.uptimeMs / 1000)}s · 空闲 ${Math.round((s.idleMs ?? 0) / 1000)}s `,
                   h('button', { className: 'krun-btn', onClick: () => stopSession(s.key), disabled: !s.alive }, '停止')))),
@@ -197,11 +206,21 @@ window.__ModuleLoader__.load({
           Object.keys(workspaces).length === 0
             ? h('div', { className: 'krun-muted' }, '无绑定（全部工作区用默认镜像）')
             : Object.entries(workspaces).map(([ws, b]) => h('div', { className: 'krun-row', key: ws },
-                h('span', null, `${ws} → ${imageById[b.imageId]?.name ?? b.imageId}`),
-                h('span', null,
-                  h('button', { className: 'krun-btn', onClick: () => unbind(ws) }, '解绑'),
-                  ' ',
-                  h('button', { className: 'krun-btn', onClick: () => resetWs(ws) }, '重置数据层')))),
+                h('span', { style: { flex: 1 } }, `${ws} → ${imageById[b.imageId]?.name ?? b.imageId}`),
+                h('select', {
+                  className: 'krun-btn',
+                  value: b.network ?? '',
+                  onChange: async (e) => {
+                    const r = await postJson('/api/krun/workspaces/network', { ws, network: e.target.value });
+                    setMsg(r.ok ? `${ws} 网络档 → ${e.target.value || '默认'}（下次会话重建生效）` : `设置失败：${r.err ?? r.status}`);
+                    refresh();
+                  },
+                },
+                  h('option', { value: '' }, '默认'),
+                  h('option', { value: 'tsi' }, 'tsi'),
+                  h('option', { value: 'none' }, 'none')),
+                h('button', { className: 'krun-btn', onClick: () => unbind(ws) }, '解绑'),
+                h('button', { className: 'krun-btn', onClick: () => resetWs(ws) }, '重置数据层'))),
           h(BindForm, { images, onMsg: setMsg, refresh })),
       );
     }
