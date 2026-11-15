@@ -31,6 +31,51 @@ const GUEST_SETUP = join(PKG_DIR, 'guest', 'setup.sh');
 
 const expandHome = (p) => (p.startsWith('~/') ? join(homedir(), p.slice(2)) : p);
 
+/** DSH 数据目录：与 @deepseek-ai/dsh-home-paths 的 defaultDshHome 语义一致
+ *  （DSH_HOME 环境变量覆盖，默认 ~/.dsh）。该包对本插件不可解析，故本地等价实现。 */
+function dshHomeDir() {
+  const env = process.env.DSH_HOME;
+  return env && env.trim() ? env.trim() : join(homedir(), '.dsh');
+}
+
+/** 默认运行期状态目录（镜像库/注册表/数据盘/run/logs），见设计 §6 布局。 */
+const DEFAULT_DATA_DIR = join(dshHomeDir(), 'storages', 'krun-vm');
+/** 旧默认目录（v0.1）：首次激活时整体迁入 DEFAULT_DATA_DIR。 */
+const LEGACY_DATA_DIR = join(homedir(), '.dsh-krun');
+
+/** 旧默认目录一次性迁入新默认：仅目标不存在时整体迁移（同盘 rename 原子；
+ *  跨设备 EXDEV 时退回复制 + 删除）；目标已存在则保留旧目录不动（不合并），
+ *  失败不阻断激活。 */
+function migrateLegacyDir(target, diag = () => {}) {
+  try {
+    if (!existsSync(LEGACY_DATA_DIR)) return;
+    if (existsSync(target)) {
+      diag(`migrate skipped: legacy ${LEGACY_DATA_DIR} kept (target exists)`);
+      return;
+    }
+    mkdirSync(dirname(target), { recursive: true });
+    try {
+      renameSync(LEGACY_DATA_DIR, target);
+    } catch (err) {
+      if (err?.code !== 'EXDEV') throw err;
+      // 跨设备（旧目录与新 DSH 数据目录不同挂载点）：退回复制后删除
+      cpSync(LEGACY_DATA_DIR, target, { recursive: true });
+      rmSync(LEGACY_DATA_DIR, { recursive: true, force: true });
+    }
+    diag(`migrated ${LEGACY_DATA_DIR} -> ${target}`);
+  } catch (err) {
+    diag(`migrate FAILED (continuing with ${target}): ${err?.message ?? err}`);
+  }
+}
+
+/** 运行期状态目录解析：显式 dataDir 优先，默认落 DSH 数据目录 storages/krun-vm（设计 §6）。
+ *  纯函数（可独立测试）；走默认路径时顺带做旧目录迁移。 */
+function resolveDataDir(config, diag = () => {}) {
+  const dir = config.dataDir ? expandHome(config.dataDir) : DEFAULT_DATA_DIR;
+  if (!config.dataDir) migrateLegacyDir(dir, diag);
+  return dir;
+}
+
 /** 会话键：workspace + 模式 → 短哈希。 */
 function sessionKey(ws, mode) {
   const h = createHash('sha1');
@@ -227,7 +272,7 @@ export class KrunSandboxProvider extends SandboxProvider {
     super(ctx);
     this.krunConfig = config;
     this.krunCtx = ctx;
-    this.krunDataDir = expandHome(config.dataDir || join(homedir(), '.dsh-krun'));
+    this.krunDataDir = resolveDataDir(config, (m) => this.krunDiag(m));
     this.krunBackendPath = expandHome(config.backendPath || join(PKG_DIR, 'bin', 'krun-backend'));
     /** key → { child, agentSock, ws, mode, logPath, lastUse, liveTerminals } */
     this.sessions = new Map();
@@ -269,6 +314,7 @@ export class KrunSandboxProvider extends SandboxProvider {
       probe: this.krunProbeCache ?? null,
       config: {
         enabled: this.krunConfig.enabled,
+        dataDir: this.krunDataDir,
         imageRootfs: this.krunConfig.imageRootfs,
         idleStopMs: this.krunConfig.idleStopMs,
         network: this.krunConfig.network,
@@ -1012,6 +1058,6 @@ class KrunTerminalSession {
   }
 }
 
-// 导出：REGISTRY/runImportJob/imagesDir 供独立测试与脚本使用（镜像管理是纯文件操作，
-// 不经 cordis 上下文；见设计 §4.1 职责分界）。
-export { KrunSandboxProvider as default, KrunTerminalBackend, REGISTRY, runImportJob, imagesDir };
+// 导出：REGISTRY/runImportJob/imagesDir/resolveDataDir 供独立测试与脚本使用（镜像与
+// 注册表是纯文件操作，不经 cordis 上下文；见设计 §4.1 职责分界）。
+export { KrunSandboxProvider as default, KrunTerminalBackend, REGISTRY, runImportJob, imagesDir, resolveDataDir };

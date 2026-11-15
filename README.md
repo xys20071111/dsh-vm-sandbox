@@ -63,4 +63,6 @@ scripts/build.sh
 - e2fsprogs 对普通文件 `mkfs.ext4`（免 root）
 - guest 镜像：默认 imageRootfs 指向准备好的 rootfs 目录树（环境相关，本机在
   `~/opt/krun-m0/images/alpine/rootfs`，provider boot 时自动烤入 agent/setup/resolv.conf）；
-  或经管理页/API 导入到 `~/.dsh-krun/images/<id>/` 后按工作区绑定
+  或经管理页/API 导入到 `<dataDir>/images/<id>/` 后按工作区绑定
+- 运行期状态目录（镜像库/注册表/数据盘/logs）：默认 `~/.dsh/storages/krun-vm`（DSH 数据目录内，
+  `DSH_HOME` 被尊重）；旧默认 `~/.dsh-krun` 在首次激活时自动整体迁入，`config.dataDir` 可显式覆盖

@@ -404,7 +404,9 @@ class KrunVmService extends Service {
 - provider 直 spawn `boot` 子进程（一 VM 一进程，`serve` 守护进程层未接线——设计偏差见附录 D）
 - `network: none`（用户要求零宿主端口占用；切 `tsi` 即得共享宿主网络 + 自动端口暴露）
 - 资源 2 vCPU / 2048 MiB，`idleStopMs` 600000（空闲回收 fiber effect 已接 + agent stat 活跃连接保护）
-- 数据层：`~/.dsh-krun/workspaces/<ws+mode 哈希>.img`（8.5G 稀疏，ext4 upper）
+- 数据层：`<dataDir>/workspaces/<ws+mode 哈希>.img`（8.5G 稀疏，ext4 upper）；dataDir 默认
+  `~/.dsh/storages/krun-vm`（2026-11-15 起迁入 DSH 数据目录，旧 `~/.dsh-krun` 首次激活自动迁移，
+  `config.dataDir` 可显式覆盖）
 - 镜像：默认 imageRootfs = Alpine minirootfs 目录树（`~/opt/krun-m0/images/alpine/rootfs`，boot 时自动烤入 agent/setup/resolv.conf）；另支持 `<dataDir>/images/<id>/` 导入镜像 + `registry.json` 工作区绑定（解析顺序 = 绑定 → imageRootfs）
 - agent 协议 v2：exec2 帧（stdout/stderr/退出码分离）+ stat（活跃连接）；旧 agent 自动回退合并流
 
@@ -428,11 +430,11 @@ ro/rw 双会话并存；`--network tsi|none` 双档（出站 TCP+DNS / 零端口
 
 ### 15.5 排障手段
 
-- `~/.dsh-krun/diag.log`：provider 激活/路由注册轨迹（krunDiag，稳定后移除）
+- `<dataDir>/diag.log`：provider 激活/路由注册轨迹（krunDiag，稳定后移除；dataDir 默认 `~/.dsh/storages/krun-vm`）
 - boot 子进程传 `RUST_LOG=debug`：TSI/vsock 全链路 trace
 - `dsh --profile web --dump-config [--patch harness/krun-overlay.yml]`：层叠与组合校验
 - `dsh headless --patch harness/krun-overlay-absolute.yml "..."`：激活级冒烟（不占 3080、不动 live 会话）
-- boot 日志：`~/.dsh-krun/logs/<key>.log`
+- boot 日志：`<dataDir>/logs/<key>.log`
 
 ### 15.6 使用要点
 
@@ -523,6 +525,13 @@ ro/rw 双会话并存；`--network tsi|none` 双档（出站 TCP+DNS / 零端口
   导入任务运行中 3s 轮询。删除保护：有绑定或运行中会话引用时拒绝。
 - **probe 语义更新**：镜像可用性 = 配置 imageRootfs（遗留单镜像路径，保持兼容）或已导入镜像任一；
   boot 时镜像解析顺序 = registry 工作区绑定 → imageRootfs，无镜像 fail-closed。
+- **运行期状态目录迁入 DSH 数据目录（2026-11-15）**：默认 dataDir 从插件自设的 `~/.dsh-krun`
+  改为 `~/.dsh/storages/krun-vm`（设计 §6 既定布局；`DSH_HOME` 环境变量被尊重——与
+  `@deepseek-ai/dsh-home-paths` 的 defaultDshHome 语义一致，该包对本插件不可解析故本地等价实现）。
+  显式 `config.dataDir` 仍优先且不触发迁移。首次激活自动迁移：同盘 rename 原子，跨设备 EXDEV
+  退回复制 + 删除；目标已存在则保留 legacy 不合并（不重试不破坏）。假 `$HOME` 沙箱实测：
+  迁移（EXDEV 复制回退 + 内容完好）与新默认目录内真实引导会话（uname/exec/workspaces img/
+  boot log 全落新目录）均通过。真实迁移在下次 live 重启激活时发生。
 
 ### M2 实测记录（2026-11-14 下午，手动 backend 会话 + harness 集成）
 
