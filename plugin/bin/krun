@@ -77,26 +77,33 @@ const main = async () => {
   conn.write(`${JSON.stringify({ type: 'term', cwd: ws, cols, rows })}\n`);
 
   let exitCode = null;
-  let carry = ''; // 未完整的尾行（代理收尾行 "EXIT:<code>" 可能跨块到达）
-  const stripExit = (text) => {
-    const m = text.match(/(\r?\n)?EXIT:(\d+)\r?\n$/);
-    if (m) {
-      exitCode = Number.parseInt(m[2], 10);
-      return text.slice(0, m.index);
-    }
-    return text;
-  };
+  let carry = ''; // 跨块累积；无换行尾段按下述规则暂存或立即写
+  // 收尾行 "EXIT:<code>" 不显示；注意不能整流行缓冲——交互回显无换行，必须立即写
+  const EXIT_LINE = /^EXIT:(\d+)\r?\n$/;
+  const MAYBE_EXIT_TAIL = /^(E|EX|EXI|EXIT|EXIT:|EXIT:\d+)$/;
   conn.on('data', (chunk) => {
     carry += typeof chunk === 'string' ? chunk : chunk.toString('utf8');
-    const nl = carry.lastIndexOf('\n');
-    if (nl >= 0) {
-      const complete = carry.slice(0, nl + 1);
+    for (;;) {
+      const nl = carry.indexOf('\n');
+      if (nl < 0) break;
+      const line = carry.slice(0, nl + 1);
       carry = carry.slice(nl + 1);
-      process.stdout.write(stripExit(complete));
+      const m = line.match(EXIT_LINE);
+      if (m) {
+        exitCode = Number.parseInt(m[1], 10);
+        continue;
+      }
+      process.stdout.write(line);
     }
+    // 无换行尾段：仅当可能是 EXIT 收尾前缀才暂存（≤32B），否则立即写
+    if (carry.length > 0 && carry.length <= 32 && MAYBE_EXIT_TAIL.test(carry)) {
+      return;
+    }
+    process.stdout.write(carry);
+    carry = '';
   });
   conn.on('close', () => {
-    process.stdout.write(stripExit(carry));
+    process.stdout.write(carry);
     process.exit(exitCode ?? 0);
   });
 
