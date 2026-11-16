@@ -45,7 +45,7 @@
 ## 构建
 
 依赖：rustup（含 `x86_64-unknown-linux-musl` target）、libclang（bindgen）、
-运行时需要 `libkrunfw.so.5`（本机用户前缀 `~/opt/libkrun/lib`）。
+运行时需要 `libkrunfw.so.5`（系统安装，或放到 `<dataDir>/tools/lib`；见下"运行时依赖"）。
 
 ```bash
 scripts/build.sh
@@ -67,13 +67,15 @@ scripts/build.sh
 注意：插件代码更新后，live web 实例需重启 dsh（或插件重载）才会加载新代码；
 已运行会话的 VM 由 provider disposer 停止，数据层天然落盘恢复。
 
-## 运行时依赖
+## 运行时依赖（全部按「环境变量 → 系统 → PATH → `<dataDir>` 捆绑」发现，不依赖任何用户目录）
 
 - `/dev/kvm` 可写（KVM API v12 实测通过）
-- `libkrunfw.so.5`（soname 固定；provider 配置 `libDir` 指向其目录）
-- e2fsprogs 对普通文件 `mkfs.ext4`（免 root）
-- guest 镜像：默认 imageRootfs 指向准备好的 rootfs 目录树（环境相关，本机在
-  `~/opt/krun-m0/images/alpine/rootfs`，provider boot 时自动烤入 agent/setup/resolv.conf）；
-  或经管理页/API 导入到 `<dataDir>/images/<id>/` 后按工作区绑定
-- 运行期状态目录（镜像库/注册表/数据盘/logs）：默认 `~/.dsh/storages/krun-vm`（DSH 数据目录内，
-  `DSH_HOME` 被尊重）；旧默认 `~/.dsh-krun` 在首次激活时自动整体迁入，`config.dataDir` 可显式覆盖
+- `libkrunfw.so.5`：系统包，或放 `libkrunfw*.tgz` 到 `<dataDir>/tools/`（激活期自动解包到
+  `tools/lib`），或 `POST /api/krun/tools {"path": "<tgz>"}` 显式安装
+- e2fsprogs（`mkfs.ext4`/`mke2fs`）：发行版默认自带；无则可放提取版到
+  `<dataDir>/tools/e2fsprogs`（注入 `KRUN_E2FSPROGS_DIR`）或设 `KRUN_MKE2FS`
+- `qemu-img`（仅 `dataDiskFormat: qcow2`）：主机 qemu-utils，或 `KRUN_QEMU_IMG`
+- **guest 镜像**：无需预置——首次使用自动自举 Alpine minirootfs 到 `<dataDir>/images/`；
+  也可管理页/API 导入，或把遗留 rootfs 目录配到 `imageRootfs`（首次使用自动迁入 dataDir）
+- 运行期资产目录：默认 `~/.dsh/storages/krun-vm`（`DSH_HOME` 被尊重），含 `images/`
+  `workspaces/` `tools/` `logs/` `run/` `registry.json`；旧默认 `~/.dsh-krun` 首次激活自动迁入

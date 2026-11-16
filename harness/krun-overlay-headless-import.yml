@@ -14,7 +14,7 @@
       config:
         enabled: true
         imageRootfs: ""
-        libDir: /home/xys/opt/libkrun/lib
+        libDir: ''
         bootTimeoutMs: 20000
         idleStopMs: 600000
         network: none

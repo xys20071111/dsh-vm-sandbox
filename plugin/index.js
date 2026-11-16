@@ -14,7 +14,7 @@
 // 镜像约定：imageRootfs 指向一个准备好的 Linux rootfs 目录树（只读使用）；
 // 引导前本插件把 guest/dsh-vm-agent 与 guest/setup.sh 烤入镜像树（幂等覆盖）。
 
-import { execFile, spawn } from 'node:child_process';
+import { execFile, execFileSync, spawn } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { connect as netConnect, createServer as netCreateServer } from 'node:net';
 import { chmodSync, createWriteStream, cpSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
@@ -113,6 +113,11 @@ function runFile(file, args, opts = {}) {
   });
 }
 
+/** 同步版外部命令（仅激活期一次性使用，如工具解包）。 */
+function runFileSync(file, args, opts = {}) {
+  execFileSync(file, args, { stdio: 'ignore', timeout: 600000, ...opts });
+}
+
 /** 解包 rootfs tarball（tar 自动识别 gz/xz/zst 压缩）。 */
 async function extractRootfsTar(tarPath, dest) {
   await runFile('tar', ['-xf', tarPath, '-C', dest]);
@@ -180,6 +185,82 @@ async function duBytes(path) {
     const out = await runFile('du', ['-sb', path], { timeout: 120000 });
     return Number.parseInt(out.split('\t')[0], 10) || 0;
   } catch { return 0; }
+}
+
+/** 插件自带的宿主侧工具根（**全部位于 dataDir 内**，不依赖 ~/opt 等用户目录）。 */
+const TOOLS_SUBDIR = 'tools';
+
+/** libkrunfw 运行时库发现（绝对不硬编码用户目录）。顺序：
+ *  ① config.libDir（显式）② 系统多架构库目录 / ldconfig 可见 ③ <dataDir>/tools/lib（插件自带）。
+ *  返回目录（供 LD_LIBRARY_PATH）与来源标签。 */
+function resolveLibDir(config, dataDir) {
+  const explicit = expandHome(config.libDir || '');
+  if (explicit) {
+    return existsSync(join(explicit, 'libkrunfw.so.5'))
+      ? { dir: explicit, source: 'config' }
+      : { dir: explicit, source: 'config-missing', missing: true };
+  }
+  const sysDirs = [
+    '/usr/lib/x86_64-linux-gnu', '/usr/lib/aarch64-linux-gnu', '/usr/lib64', '/usr/lib', '/usr/local/lib',
+  ];
+  for (const d of sysDirs) {
+    if (existsSync(join(d, 'libkrunfw.so.5'))) return { dir: d, source: 'system' };
+  }
+  const bundled = join(dataDir, TOOLS_SUBDIR, 'lib');
+  if (existsSync(join(bundled, 'libkrunfw.so.5'))) return { dir: bundled, source: 'bundled' };
+  return { dir: '', source: 'missing', missing: true };
+}
+
+/** 把 libkrunfw 预构建 tgz 解包进 <dataDir>/tools/lib（插件自持，不写系统目录）。
+ *  tarball 内常见布局 lib/<arch>/libkrunfw.so*，统一拍平到 tools/lib。 */
+async function extractLibkrunfw(tarPath, dataDir) {
+  const dest = join(dataDir, TOOLS_SUBDIR, 'lib');
+  const tmp = mkdtempSync(join(tmpdir(), 'krunfw-'));
+  try {
+    await runFile('tar', ['-xzf', tarPath, '-C', tmp]);
+    const found = [];
+    const walk = (dir) => {
+      for (const e of readdirSync(dir, { withFileTypes: true })) {
+        const full = join(dir, e.name);
+        if (e.isDirectory()) walk(full);
+        else if (e.name.startsWith('libkrunfw.so')) found.push(full);
+      }
+    };
+    walk(tmp);
+    if (found.length === 0) throw new Error(`no libkrunfw.so* inside ${tarPath}`);
+    mkdirSync(dest, { recursive: true });
+    for (const f of found) {
+      cpSync(f, join(dest, basename(f)));
+      chmodSync(join(dest, basename(f)), 0o755);
+    }
+    // 确保 soname 链接存在（libkrunfw.so.5 → 实际版本文件）
+    const lib5 = join(dest, 'libkrunfw.so.5');
+    if (!existsSync(lib5)) {
+      const versioned = readdirSync(dest).find((f) => /^libkrunfw\.so\.5\.\d+/.test(f));
+      if (versioned) cpSync(join(dest, versioned), lib5);
+    }
+    return { dest, files: readdirSync(dest) };
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+/** 构造子进程环境：LD_LIBRARY_PATH（libkrunfw）+ KRUN_E2FSPROGS_DIR（捆绑的 e2fsprogs，
+ *  可选）+ KRUN_TOOLS_DIR（工具根）。全部指向 dataDir 内部或系统路径。 */
+function toolEnv(config, dataDir, base = process.env) {
+  const env = { ...base };
+  const lib = resolveLibDir(config, dataDir);
+  const paths = [];
+  if (lib.dir) paths.push(lib.dir);
+  const tools = join(dataDir, TOOLS_SUBDIR);
+  env.KRUN_TOOLS_DIR = tools;
+  const e2fs = join(tools, 'e2fsprogs');
+  if (existsSync(e2fs)) env.KRUN_E2FSPROGS_DIR = e2fs;
+  if (paths.length > 0) {
+    const prev = env.LD_LIBRARY_PATH;
+    env.LD_LIBRARY_PATH = prev ? `${paths.join(':')}:${prev}` : paths.join(':');
+  }
+  return env;
 }
 
 /** 镜像库根：<dataDir>/images/<imageId>/{manifest.json, rootfs}（设计 §6）。 */
@@ -291,6 +372,8 @@ export class KrunSandboxProvider extends SandboxProvider {
     this.krunCtx = ctx;
     this.krunDataDir = resolveDataDir(config, (m) => this.krunDiag(m));
     this.krunBackendPath = expandHome(config.backendPath || join(PKG_DIR, 'bin', 'krun-backend'));
+    // 工具自持：dataDir/tools 内若放着 libkrunfw 预构建包，激活时自动解包到 tools/lib
+    this.krunAutoInstallTools();
     /** key → { child, agentSock, ws, mode, logPath, lastUse, liveTerminals } */
     this.sessions = new Map();
     /** 单飞引导：同一 key 的并发 confine 共享一次启动 */
@@ -432,6 +515,30 @@ export class KrunSandboxProvider extends SandboxProvider {
         }
       },
     }, 'krun-vm: POST /api/krun/ensure');
+    registerRoute({
+      kind: 'exact',
+      path: '/api/krun/tools',
+      handler: async (req, res) => {
+        if (req.method === 'GET') {
+          sendJson(res, 200, { ok: true, probe: await this.probe(), ...this.krunStatusSnapshot().config });
+          return;
+        }
+        if (req.method !== 'POST') { res.writeHead(405); res.end(); return; }
+        const body = await readBody(req);
+        const tarPath = String(body.path ?? '');
+        if (!tarPath || !existsSync(expandHome(tarPath))) {
+          sendJson(res, 400, { ok: false, err: `libkrunfw tarball not found: ${tarPath || '(empty)'}` });
+          return;
+        }
+        try {
+          await extractLibkrunfw(expandHome(tarPath), this.krunDataDir);
+          this.krunProbeCache = undefined;
+          sendJson(res, 200, { ok: true, probe: await this.probe() });
+        } catch (err) {
+          sendJson(res, 500, { ok: false, err: String(err?.message ?? err) });
+        }
+      },
+    }, 'krun-vm: /api/krun/tools');
     registerRoute({
       kind: 'exact',
       path: '/api/krun/images',
@@ -603,9 +710,83 @@ export class KrunSandboxProvider extends SandboxProvider {
       const rootfs = join(this.krunImagesDir(), binding.imageId, 'rootfs');
       if (existsSync(rootfs)) return rootfs;
     }
+    // 遗留 config.imageRootfs：仍支持，但仅作为最后手段（且会在首次使用时迁入 dataDir）
     const legacy = expandHome(this.krunConfig.imageRootfs);
     if (legacy && existsSync(legacy)) return legacy;
     return null;
+  }
+
+  /** 确保有可用镜像（**所有镜像资产最终都在 <dataDir>/images 内**）：
+   *  ① 工作区绑定 ② 已导入镜像（首选） ③ 遗留 config.imageRootfs → 迁入 images/ 后使用
+   *  ④ 都没有 → 自举官方 Alpine minirootfs（宿主网络下载，一次性）。
+   *  返回 { rootfs, imageId } 或 null。 */
+  async krunEnsureImage(ws) {
+    const bound = this.krunResolveImage(ws);
+    if (bound && bound.startsWith(this.krunImagesDir())) {
+      return { rootfs: bound, imageId: basename(dirname(bound)) };
+    }
+    const imported = this.krunListImages();
+    if (imported.length > 0) {
+      const pick = imported[0];
+      const rootfs = join(this.krunImagesDir(), pick.id, 'rootfs');
+      if (existsSync(rootfs)) return { rootfs, imageId: pick.id };
+    }
+    if (bound) {
+      // 遗留外部目录：迁入 dataDir（满足"插件资产不出 dataDir"），避免继续依赖用户目录
+      const moved = await this.krunAdoptExternalImage(bound);
+      if (moved) return moved;
+    }
+    const boot = await this.krunBootstrapDefaultImage();
+    return boot;
+  }
+
+  /** 把遗留的外部 imageRootfs 目录迁入 <dataDir>/images（同盘 rename；跨设备 cp+rm）。 */
+  async krunAdoptExternalImage(srcDir) {
+    const id = `img-adopted-${Date.now().toString(36)}`;
+    const rootfs = join(this.krunImagesDir(), id, 'rootfs');
+    try {
+      mkdirSync(dirname(rootfs), { recursive: true });
+      try {
+        renameSync(srcDir, rootfs);
+      } catch (err) {
+        if (err?.code !== 'EXDEV') throw err;
+        cpSync(srcDir, rootfs, { recursive: true });
+        rmSync(srcDir, { recursive: true, force: true });
+      }
+      await this.bakeGuestFiles(rootfs);
+      const manifest = {
+        id,
+        name: basename(srcDir),
+        distro: existsSync(join(rootfs, 'etc', 'alpine-release')) ? 'alpine' : 'linux',
+        arch: process.arch,
+        created: new Date().toISOString(),
+        source: `adopted:${srcDir}`,
+        format: 'dir',
+        sizeBytes: await duBytes(join(this.krunImagesDir(), id)),
+      };
+      writeFileSync(join(this.krunImagesDir(), id, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
+      this.krunDiag(`adopted external image ${srcDir} -> ${id}`);
+      return { rootfs, imageId: id };
+    } catch (err) {
+      this.krunDiag(`adopt external image FAILED: ${err?.message ?? err}`);
+      return null;
+    }
+  }
+
+  /** 自举默认镜像：下载官方 Alpine minirootfs 到 <dataDir>/images（一次性，宿主网络）。 */
+  async krunBootstrapDefaultImage() {
+    const arch = process.arch === 'arm64' ? 'aarch64' : 'x86_64';
+    const url = `https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/${arch}/alpine-minirootfs-3.22.0-${arch}.tar.gz`;
+    const job = { id: `bootstrap-${Date.now().toString(36)}`, kind: 'url', label: 'alpine-minirootfs', status: 'running', startedAt: Date.now() };
+    this.krunDiag(`bootstrapping default image from ${url}`);
+    try {
+      const manifest = await runImportJob(this.krunDataDir, job, { url, name: 'alpine-minirootfs-3.22' }, (m) => this.krunDiag(m));
+      this.krunImagesCache = undefined;
+      return { rootfs: join(this.krunImagesDir(), manifest.id, 'rootfs'), imageId: manifest.id };
+    } catch (err) {
+      this.krunDiag(`bootstrap default image FAILED: ${job.error ?? err?.message ?? err}`);
+      return null;
+    }
   }
 
   /** 镜像导入任务（HTTP 层薄封装；核心见 runImportJob）。 */
@@ -810,6 +991,43 @@ export class KrunSandboxProvider extends SandboxProvider {
     return { image, network, binding };
   }
 
+  /** 激活期工具自持：<dataDir>/tools/ 下的 libkrunfw tgz 自动解包到 tools/lib。
+   *  失败不阻断激活（probe 会如实报告缺失），仅供无人值守安装。 */
+  krunAutoInstallTools() {
+    try {
+      const toolsDir = join(this.krunDataDir, TOOLS_SUBDIR);
+      mkdirSync(toolsDir, { recursive: true });
+      if (existsSync(join(toolsDir, 'lib', 'libkrunfw.so.5'))) return;
+      const tarballs = readdirSync(toolsDir).filter((f) => /^libkrunfw.*\.(tgz|tar\.gz)$/.test(f));
+      if (tarballs.length === 0) return;
+      const tarPath = join(toolsDir, tarballs[0]);
+      // 同步解包（激活期一次，体积 ~9MB）；失败留给 probe 报告
+      const tmp = mkdtempSync(join(tmpdir(), 'krunfw-'));
+      try {
+        runFileSync('tar', ['-xzf', tarPath, '-C', tmp]);
+        const dest = join(toolsDir, 'lib');
+        mkdirSync(dest, { recursive: true });
+        const stack = [tmp];
+        while (stack.length > 0) {
+          const dir = stack.pop();
+          for (const e of readdirSync(dir, { withFileTypes: true })) {
+            const full = join(dir, e.name);
+            if (e.isDirectory()) stack.push(full);
+            else if (e.name.startsWith('libkrunfw.so')) {
+              cpSync(full, join(dest, e.name));
+              chmodSync(join(dest, e.name), 0o755);
+            }
+          }
+        }
+        this.krunDiag(`auto-installed libkrunfw from ${tarballs[0]}`);
+      } finally {
+        rmSync(tmp, { recursive: true, force: true });
+      }
+    } catch (err) {
+      this.krunDiag(`auto-install tools FAILED: ${err?.message ?? err}`);
+    }
+  }
+
   /** 工作区设置变更后失效本实例的会话缓存：下次 ensure 重新走指纹比对，
    *  档位/镜像变化的会话由守护进程停旧启新。 */
   krunInvalidateWsCache(ws) {
@@ -831,13 +1049,41 @@ export class KrunSandboxProvider extends SandboxProvider {
       problems.push('/dev/kvm not accessible');
     }
     if (!existsSync(this.krunBackendPath)) problems.push(`backend missing: ${this.krunBackendPath}`);
-    // 镜像可用性：默认 imageRootfs（遗留路径）或已导入镜像任一即可
+    // libkrunfw：系统库或 <dataDir>/tools/lib 自带（插件不依赖用户目录）
+    const lib = resolveLibDir(this.krunConfig, this.krunDataDir);
+    if (lib.missing) {
+      problems.push(
+        `libkrunfw.so.5 not found (searched config.libDir, system library dirs, <dataDir>/tools/lib) — ` +
+        `install it system-wide or drop the prebuilt tarball into ${join(this.krunDataDir, TOOLS_SUBDIR, 'lib')}`,
+      );
+    }
+    // 磁盘格式化工具：系统 e2fsprogs 或 <dataDir>/tools/e2fsprogs 捆绑版
+    const e2fsBundled = existsSync(join(this.krunDataDir, TOOLS_SUBDIR, 'e2fsprogs', 'usr', 'sbin', 'mke2fs'))
+      || existsSync(join(this.krunDataDir, TOOLS_SUBDIR, 'e2fsprogs', 'sbin', 'mke2fs'));
+    const e2fsSystem = ['/usr/sbin/mkfs.ext4', '/sbin/mkfs.ext4', '/usr/sbin/mke2fs', '/sbin/mke2fs']
+      .some((p) => existsSync(p));
+    const e2fsPath = (process.env.PATH ?? '').split(':').some((d) => d
+      && ['mkfs.ext4', 'mke2fs'].some((n) => existsSync(join(d, n))));
+    if (!(e2fsSystem || e2fsPath || e2fsBundled || process.env.KRUN_MKE2FS)) {
+      problems.push(
+        'no ext4 formatter: install e2fsprogs or place an extraction at ' +
+        `${join(this.krunDataDir, TOOLS_SUBDIR, 'e2fsprogs')}`,
+      );
+    }
+    // 镜像：已导入或可自举（自举需宿主网络，不作为不可用判据）
     const legacy = expandHome(this.krunConfig.imageRootfs);
     const imported = this.krunListImages();
-    if ((!legacy || !existsSync(legacy)) && imported.length === 0) {
-      problems.push('no image: imageRootfs not configured/missing and no imported images');
-    }
-    this.krunProbeCache = { ok: problems.length === 0, detail: problems.join('; ') };
+    this.krunProbeCache = {
+      ok: problems.length === 0,
+      detail: problems.join('; '),
+      facts: {
+        libkrunfw: { dir: lib.dir, source: lib.source },
+        e2fsprogs: { system: e2fsSystem || e2fsPath, bundled: e2fsBundled },
+        toolsDir: join(this.krunDataDir, TOOLS_SUBDIR),
+        dataDir: this.krunDataDir,
+        images: { imported: imported.length, legacyRootfs: Boolean(legacy && existsSync(legacy)) },
+      },
+    };
     return this.krunProbeCache;
   }
 
@@ -882,9 +1128,7 @@ export class KrunSandboxProvider extends SandboxProvider {
       s.on('error', () => { clearTimeout(timer); s.destroy(); res(false); });
     });
     const spawnDaemon = () => new Promise((res) => {
-      const env = { ...process.env };
-      const libDir = expandHome(this.krunConfig.libDir);
-      if (libDir) env.LD_LIBRARY_PATH = libDir;
+      const env = toolEnv(this.krunConfig, this.krunDataDir);
       const child = spawn(this.krunBackendPath, ['serve', '--socket', sockPath], {
         env,
         stdio: 'ignore',
@@ -1046,11 +1290,16 @@ export class KrunSandboxProvider extends SandboxProvider {
     const probe = await this.probe();
     if (!probe.ok) throw new SandboxUnavailableError(policy.mode, `krun VM unavailable — ${probe.detail}`);
 
-    // 镜像解析：工作区绑定 → 默认 imageRootfs（无镜像 fail-closed）
-    const imageRootfs = this.krunResolveImage(ws);
-    if (!imageRootfs) {
-      throw new SandboxUnavailableError(policy.mode, `krun VM unavailable — no image for ${ws} (import an image or set imageRootfs)`);
+    // 镜像解析：工作区绑定 → 已导入镜像 → 遗留 imageRootfs（迁入 dataDir）→ 自举 Alpine。
+    // 全部资产最终都位于 <dataDir>/images（不依赖任何用户目录）。
+    const resolved = await this.krunEnsureImage(ws);
+    if (!resolved) {
+      throw new SandboxUnavailableError(
+        policy.mode,
+        `krun VM unavailable — no usable image for ${ws}: no binding, no imported image, and the bootstrap download failed (see ${join(this.krunDataDir, 'diag.log')})`,
+      );
     }
+    const imageRootfs = resolved.rootfs;
     this.bakeGuestFiles(imageRootfs);
     // qcow2 数据层首次启动在 guest 内格式化：镜像缺 e2fsprogs 时按需补装（宿主网络，幂等）
     if ((this.krunConfig.dataDiskFormat ?? 'raw') === 'qcow2') {
@@ -1156,9 +1405,7 @@ export class KrunSandboxProvider extends SandboxProvider {
     for (const pm of this.krunConfig.portMap ?? []) confineArgs.push('--forward', pm);
     if ((this.krunConfig.dataDiskFormat ?? 'raw') === 'qcow2') confineArgs.push('--data-format', 'qcow2');
 
-    const env = { ...process.env };
-    const libDir = expandHome(this.krunConfig.libDir);
-    if (libDir) env.LD_LIBRARY_PATH = libDir;
+    const env = toolEnv(this.krunConfig, this.krunDataDir);
 
     const out = openSync(logPath, 'a');
     const child = spawn(this.krunBackendPath, confineArgs, {

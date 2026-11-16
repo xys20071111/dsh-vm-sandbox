@@ -13,8 +13,8 @@
       name: /home/xys/workspace/VibeCoding/sandbox/plugin/index.js
       config:
         enabled: true
-        imageRootfs: /home/xys/opt/krun-m0/images/alpine/rootfs
-        libDir: /home/xys/opt/libkrun/lib
+        imageRootfs: ''
+        libDir: ''
         bootTimeoutMs: 20000
         idleStopMs: 600000
         network: none

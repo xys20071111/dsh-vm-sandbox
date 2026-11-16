@@ -171,15 +171,19 @@ krun_start_enter(ctx);                      // 阻塞至 VM 关闭
 
 ### 4.4 运行时依赖与安装
 
-| 依赖 | 获取 | 探测 |
+**资产位置原则（2026-11-16 修正）**：插件**不得依赖用户目录下的任何路径**（曾硬编码 `~/opt/e2fsprogs`、`~/opt/krun-m0/images`、`~/opt/libkrun/lib`，普通机器根本不存在 ⇒ 建盘直接失败）。所有宿主侧插件资产一律落在 `<dataDir>`（默认 `~/.dsh/storages/krun-vm`）内，其余依赖按「环境变量 → 系统路径 → PATH → dataDir 捆绑」四级发现。
+
+| 依赖 | 获取 | 发现顺序（绝不硬编码用户目录） |
 |---|---|---|
-| `libkrunfw.so.5`（内核捆绑库；libkrun 已进程内编译进 krun-backend，运行时由其 dlopen） | 系统包 / 官方 release 预构建 tgz（v5.6.4 实测可用） | dlopen 探测；缺失 → 回退 ladder + 管理页提示（`LD_LIBRARY_PATH` 或紧邻二进制 + rpath） |
+| `libkrunfw.so.5`（内核捆绑库；libkrun 已进程内编译进 krun-backend，运行时由其 dlopen） | 系统包 / 官方 release 预构建 tgz（v5.6.4 实测可用）；插件自持位置 `<dataDir>/tools/lib` | `config.libDir` → 系统多架构库目录（含 `ldconfig` 可见面）→ `<dataDir>/tools/lib`；缺失即 fail-closed 并在环境体检给出动作。`<dataDir>/tools/libkrunfw*.tgz` 存在时**激活期自动解包**；`POST /api/krun/tools` 可显式安装 |
 | `/dev/kvm` 可写 | 现有内核模块 | `open` + `KVM_GET_API_VERSION` ioctl |
 | overlayfs | **guest 内核自带（libkrunfw `CONFIG_OVERLAY_FS=y`，已核实）** | 宿主侧无探测项；隐式 init 在只读根下的兼容性由 M0 验证 |
-| e2fsprogs（对普通文件 `mkfs.ext4`，免 root） | 宿主发行版自带 | 探测 `mkfs.ext4` 可执行；缺失则捆绑静态 mke2fs 兜底 |
+| e2fsprogs（对普通文件 `mkfs.ext4`，免 root） | 宿主发行版自带（Debian/Ubuntu 默认安装）；无系统的发行版可放提取版到 `<dataDir>/tools/e2fsprogs` | `KRUN_MKE2FS` → 系统绝对路径（`/usr/sbin`、`/sbin` 等；**PATH 常不含 /sbin，必须显式查**）→ PATH 查找 → `<dataDir>/tools/e2fsprogs`（注入 `KRUN_E2FSPROGS_DIR`） |
+| `qemu-img`（仅 qcow2 数据层） | 宿主 qemu-utils | `KRUN_QEMU_IMG` → 系统路径 → PATH → `<dataDir>/tools/bin` |
 | guest agent 静态二进制 | 插件包内附带 | 版本握手（协议头） |
+| **guest 镜像** | 首次使用自动自举官方 Alpine minirootfs 到 `<dataDir>/images`（宿主网络）；或管理页导入 | 工作区绑定 → 已导入镜像 → 遗留 `config.imageRootfs`（**自动迁入 `<dataDir>/images`**）→ 自举 |
 
-管理页提供"环境体检"面板展示上述四项，作为 `SANDBOX_UNAVAILABLE` 的可视化归因。
+管理页"环境体检"面板展示上述项目（含 `toolsDir`/`dataDir` 实际路径与每项来源：system/bundled/missing），作为 `SANDBOX_UNAVAILABLE` 的可视化归因。
 
 ---
 
@@ -413,7 +417,7 @@ class KrunVmService extends Service {
 - 数据层：`<dataDir>/workspaces/<ws+mode 哈希>.img`（8.5G 稀疏，ext4 upper）；dataDir 默认
   `~/.dsh/storages/krun-vm`（2026-11-15 起迁入 DSH 数据目录，旧 `~/.dsh-krun` 首次激活自动迁移，
   `config.dataDir` 可显式覆盖）
-- 镜像：默认 imageRootfs = Alpine minirootfs 目录树（`~/opt/krun-m0/images/alpine/rootfs`，boot 时自动烤入 agent/setup/resolv.conf）；另支持 `<dataDir>/images/<id>/` 导入镜像 + `registry.json` 工作区绑定（解析顺序 = 绑定 → imageRootfs）
+- 镜像：全部位于 `<dataDir>/images/<id>/`（导入或首次自动自举 Alpine）；`registry.json` 工作区绑定；`config.imageRootfs` 仅作遗留兼容且首次使用时自动迁入 dataDir
 - agent 协议 v2：exec2 帧（stdout/stderr/退出码分离）+ stat（活跃连接）；旧 agent 自动回退合并流
 
 ### 15.3 已验证能力（证据见附录 C）
@@ -469,7 +473,7 @@ qcow2 数据层（guest 内首启格式化 + 持久化）；侧栏终端桥（�
 
 ## 附录 C：M0 实测记录（2026-11-14，本机 x86_64 + KVM API v12）
 
-- 环境：libkrun 1.19.8（vendor stable-1.19.x 源码编译）+ libkrunfw 5.6.4（官方 release 预构建 tgz，用户前缀 `~/opt/libkrun/lib`）；官方 C 示例 chroot_vm 引导通过。
+- 环境：libkrun 1.19.8（vendor stable-1.19.x 源码编译）+ libkrunfw 5.6.4（官方 release 预构建 tgz，当时置于用户前缀 `~/opt/libkrun/lib`，**现改为 `<dataDir>/tools/lib`**）；官方 C 示例 chroot_vm 引导通过。
 - **直接依赖可行性**：`src/libkrun` `[lib] crate-type = ["cdylib","lib"]`、C 函数全 `pub extern "C"`、libkrunfw 由 libkrun 运行时 dlopen（soname `libkrunfw.so.5`，无 env 覆盖）→ backend path 依赖 + 进程内直调，引导冒烟 `RUST-DEP-OK` 通过。
 - **argv 约定（关键坑）**：`krun_set_exec` 的 args **不含 argv[0]**（C 示例传 `&guest_argv[1]`）；多传程序名 → guest 内 sh 报 `syntax error: unexpected word`。早期 koffi 失败的根因即此（而非"借用指针"——`collapse_str_array` 调用时即复制）。
 - **数组边界**：argv/envp/port_map 按 `MAX_ARGS=4096` 定长 `from_raw_parts` 切片（NULL 截断）；包装层分配满长 NULL 填充数组规避越界切片。
@@ -477,7 +481,7 @@ qcow2 数据层（guest 内首启格式化 + 持久化）；侧栏终端桥（�
 - 构建注意：vendor 树含 bindgen 依赖 → 构建 backend 需 `LIBCLANG_PATH`（本机以符号链接 `libclang.so → libclang-21.so.1` 解决）；运行 `krun-backend` 需 `LD_LIBRARY_PATH` 指向 libkrunfw 所在目录。
 - 性能参考：release 构建 23s（16 核）；VM 引导至 workload 输出亚秒级。
 - **M0.2 编排实测**：`mount --move` 目标为 overlay 时 EINVAL → 改为新根上全新挂载伪 fs（proc/sys/devtmpfs/devpts/shm）；**overlayfs-on-virtiofs-upper 存在上游级摩擦**——内核 overlay 的 workdir 创建（`/run/data/work/work`）得到 mode 000 目录 → EACCES → 只读降级（SIMPLIFIED/COMPLETE 两种语义均复现，dmesg: `failed to create directory … (errno: 13); mounting read-only`；另 `failed to set uuid … falling back to uuid=null`）→ 数据层改用 **ext4 稀疏盘 + virtio-blk**（overlay-on-ext4 经典路径，实测 rw 写入 + 跨重启持久化 ✓）；mke2fs 免 root 获取：`apt-get download e2fsprogs libext2fs2t64 …` + `dpkg-deb -x` 提取运行；内核 6.12 要求无 upper 的 overlay 至少 2 个 lowerdir（ro 会话补空 tmpfs 第二 lower ✓）。
-- **工作区同路径挂载**：缺失路径段前的祖先目录盖 tmpfs、其余段普通 mkdir 后挂 workspace virtiofs tag——实测 guest 内 `pwd` = `/home/xys/opt/krun-m0/ws-test` ✓，双向共享 ✓。
+- **工作区同路径挂载**：缺失路径段前的祖先目录盖 tmpfs、其余段普通 mkdir 后挂 workspace virtiofs tag——实测 guest 内 `pwd` 与宿主同路径 ✓，双向共享 ✓（当时用 `~/opt` 下的测试工作区，现资产一律在 dataDir）。
 - **M0.4 vsock 回环 ✓**：`krun_add_vsock_port2(42, agent.sock, listen=true)` 由 VMM 监听 UNIX socket、按连接桥接 guest vsock；musl static-pie agent（AF_VSOCK=40 监听 CID_ANY:42）fork/exec + 管道中继 + `EXIT:<code>` 回传；`krun-backend exec` 客户端 3/3 成功、退出码传播正确。注意：VM 退出后 VMM 不清理 agent.sock（陈旧 socket 连接报 ECONNREFUSED），守护进程需在会话表里处理。
 - **脚本坑**：`set -- $WS` 会覆盖位置参数——`$3` 在其之后失效；调试输出显示 `$3=agent` 但分支判断失败即此原因（已改为先存 `AGENT="$3"`）。另：console 设备的 stdout/stderr 双端口会使每行日志成对出现。
 - **M1 实测（2026-11-14 15:37 端到端打通）**：
@@ -540,6 +544,27 @@ qcow2 数据层（guest 内首启格式化 + 持久化）；侧栏终端桥（�
   迁移（EXDEV 复制回退 + 内容完好）与新默认目录内真实引导会话（uname/exec/workspaces img/
   boot log 全落新目录）均通过。live 重启实测迁移完成，绑定/镜像/数据盘完好（管理页与 `/vm`
   经用户确认通过）。
+
+### 可移植性修正（2026-11-16，用户报告的严重问题）
+
+- **硬编码 `~/opt` 是致命 bug**：`krun-backend` 的 `ensure_data_img` 曾无条件使用
+  `{HOME}/opt/e2fsprogs/usr/sbin/mke2fs`（+ 对应 LD_LIBRARY_PATH），镜像/libDir 也指向
+  `~/opt/...`。普通机器根本没有这些目录 ⇒ **新建工作区数据盘直接失败**（用户实测复现）。
+  更讽刺的是本机 `/sbin/mke2fs`、`/usr/sbin/mkfs.ext4` 一直都在，只是 `which` 因 PATH
+  不含 `/sbin` 查不到、代码也从不查系统路径。
+- **四级发现 + 资产内聚**：见 §4.4 表格。要点：① 系统绝对路径优先（PATH 不可靠）；
+  ② 所有插件资产落 `<dataDir>`（`tools/lib` libkrunfw、`tools/e2fsprogs` 可选提取版、
+  `images/` 镜像）③ 遗留外部 `imageRootfs` 首次使用时**自动迁入** `<dataDir>/images`
+  （同盘 rename / 跨设备复制）④ 无任何镜像时自举 Alpine minirootfs ⑤ `<dataDir>/tools`
+  下的 libkrunfw tgz 激活期自动解包。
+- **E2E 验证（真实 dataDir、无 `~/opt`）**：probe 报告 `libkrunfw: bundled(tools/lib)`、
+  `e2fsprogs: system`；live `POST /api/krun/ensure` 触发真实建盘（8G 稀疏 ext4，系统
+  mke2fs）→ VM 引导 → guest `uname -r` / `df -h /` / agent 在位全部正常。
+  另以「全新 dataDir + 空配置」模拟普通机器：镜像自动自举下载 → 建盘 → 引导 → 持久化写入
+  全部通过。
+- **清理**：实时 profile 与 harness 全部 overlay 中的 `~/opt` 绝对路径已移除（`imageRootfs`
+  与 `libDir` 置空 ⇒ 走发现/自举）；`~/downloads/libkrunfw` 内容已迁入
+  `<dataDir>/tools/lib`（`libkrunfw.so{,.5,.5.6.4}`）。
 
 ### M4 打磨实测（2026-11-15）
 

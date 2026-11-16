@@ -158,12 +158,15 @@ fn ensure_data_img(img: &std::path::Path, size_mib: u64, format: &str) -> Result
     use std::io::{Read, Seek, SeekFrom, Write};
     if !img.exists() {
         if format == "qcow2" {
-            let status = std::process::Command::new("qemu-img")
+            let qemu_img = find_tool("KRUN_QEMU_IMG", "qemu-img", &["/usr/bin/qemu-img", "/usr/local/bin/qemu-img"])
+                .ok_or_else(|| "qemu-img not found — install qemu-utils to use the qcow2 data layer, \
+                                or set KRUN_QEMU_IMG to its absolute path".to_string())?;
+            let status = std::process::Command::new(&qemu_img)
                 .args(["create", "-f", "qcow2"])
                 .arg(img)
                 .arg(format!("{}M", size_mib))
                 .status()
-                .map_err(|e| format!("spawn qemu-img: {e} (安装 qemu-utils 以使用 qcow2 数据层)"))?;
+                .map_err(|e| format!("spawn {qemu_img}: {e}"))?;
             if !status.success() {
                 return Err(format!("qemu-img create failed: {status}"));
             }
@@ -192,20 +195,143 @@ fn ensure_data_img(img: &std::path::Path, size_mib: u64, format: &str) -> Result
         return Ok(()); // 已格式化
     }
     drop(f);
-    let home = std::env::var("HOME").unwrap_or_default();
-    let mke2fs = std::env::var("KRUN_MKE2FS")
-        .unwrap_or_else(|_| format!("{home}/opt/e2fsprogs/usr/sbin/mke2fs"));
-    let libdir = format!("{home}/opt/e2fsprogs/usr/lib/x86_64-linux-gnu");
-    let status = std::process::Command::new(&mke2fs)
-        .env("LD_LIBRARY_PATH", &libdir)
+    let (mke2fs, extra_env) = find_mke2fs()?;
+    let mut cmd = std::process::Command::new(&mke2fs);
+    for (k, v) in &extra_env {
+        cmd.env(k, v);
+    }
+    let status = cmd
         .args(["-F", "-q", "-t", "ext4", "-m", "0"])
         .arg(img)
         .status()
         .map_err(|e| format!("spawn {mke2fs}: {e}"))?;
     if !status.success() {
-        return Err(format!("mke2fs failed: {status}"));
+        return Err(format!("{mke2fs} failed: {status}"));
     }
     Ok(())
+}
+
+/// 通用外部工具发现：`<ENV>` 显式指定 → 系统绝对路径 → PATH → 捆绑目录（KRUN_TOOLS_DIR/bin）。
+/// 绝不硬编码 `~` 下的任何路径（插件资源一律在 dataDir 内）。
+fn find_tool(env_key: &str, name: &str, system_paths: &[&str]) -> Option<String> {
+    if let Ok(v) = std::env::var(env_key) {
+        if !v.trim().is_empty() && std::path::Path::new(&v).is_file() {
+            return Some(v);
+        }
+    }
+    for p in system_paths {
+        if std::path::Path::new(p).is_file() {
+            return Some((*p).to_string());
+        }
+    }
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in path.split(':').filter(|d| !d.is_empty()) {
+            let cand = format!("{dir}/{name}");
+            if std::path::Path::new(&cand).is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    if let Ok(tools) = std::env::var("KRUN_TOOLS_DIR") {
+        let cand = format!("{tools}/bin/{name}");
+        if std::path::Path::new(&cand).is_file() {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+/// 磁盘格式化工具发现（**绝不硬编码用户目录**）：按序探测
+/// ① `KRUN_MKE2FS` 环境变量（显式指定，可指向 dataDir 内捆绑的提取版）
+/// ② 系统绝对路径（PATH 常缺 /sbin ⇒ 必须显式查；发行版镜像普遍自带 e2fsprogs）
+/// ③ PATH 查找 `mkfs.ext4` / `mke2fs`
+/// ④ `<dataDir>/tools/e2fsprogs/usr/sbin/mke2fs`（插件捆绑的提取版，供无 e2fsprogs 的宿主）
+/// 返回 (可执行路径, 需追加的环境变量)。
+fn find_mke2fs() -> Result<(String, Vec<(String, String)>), String> {
+    let is_exe = |p: &str| std::path::Path::new(p).is_file();
+
+    if let Ok(custom) = std::env::var("KRUN_MKE2FS") {
+        if !custom.trim().is_empty() {
+            if !is_exe(&custom) {
+                return Err(format!("KRUN_MKE2FS points to a missing executable: {custom}"));
+            }
+            let env = mke2fs_lib_env(&mke2fs_prefix(&custom));
+            return Ok((custom, env));
+        }
+    }
+
+    for cand in [
+        "/usr/sbin/mkfs.ext4",
+        "/sbin/mkfs.ext4",
+        "/usr/sbin/mke2fs",
+        "/sbin/mke2fs",
+        "/usr/bin/mkfs.ext4",
+        "/usr/bin/mke2fs",
+        "/usr/local/sbin/mkfs.ext4",
+        "/usr/local/sbin/mke2fs",
+    ] {
+        if is_exe(cand) {
+            return Ok((cand.to_string(), Vec::new()));
+        }
+    }
+
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in path.split(':').filter(|d| !d.is_empty()) {
+            for name in ["mkfs.ext4", "mke2fs"] {
+                let cand = format!("{dir}/{name}");
+                if is_exe(&cand) {
+                    return Ok((cand, Vec::new()));
+                }
+            }
+        }
+    }
+
+    // 插件捆绑的提取版（dataDir/tools/e2fsprogs）：由宿主环境变量注入其根目录
+    if let Ok(root) = std::env::var("KRUN_E2FSPROGS_DIR") {
+        for sub in ["usr/sbin/mke2fs", "sbin/mke2fs", "usr/sbin/mkfs.ext4"] {
+            let cand = format!("{root}/{sub}");
+            if is_exe(&cand) {
+                return Ok((cand, mke2fs_lib_env(&root)));
+            }
+        }
+    }
+
+    Err("no ext4 formatting tool found — install e2fsprogs (mkfs.ext4/mke2fs) on the host, \
+         or place a bundled extraction at <dataDir>/tools/e2fsprogs and set KRUN_E2FSPROGS_DIR"
+        .into())
+}
+
+/// 提取版 e2fsprogs 的根（`<root>/usr/sbin/mke2fs` → `<root>/usr`）。
+fn mke2fs_prefix(exe: &str) -> String {
+    let mut p = std::path::Path::new(exe).to_path_buf();
+    for _ in 0..3 {
+        if p.pop() {
+            if p.ends_with("usr") {
+                return p.to_string_lossy().into_owned();
+            }
+        }
+    }
+    std::path::Path::new(exe)
+        .parent()
+        .map(|d| d.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// 提取版 e2fsprogs 需要指向其自带库目录（否则找不到 libext2fs）。
+fn mke2fs_lib_env(prefix: &str) -> Vec<(String, String)> {
+    let p = std::path::Path::new(prefix);
+    let mut libs: Vec<String> = Vec::new();
+    for sub in ["lib/x86_64-linux-gnu", "lib/aarch64-linux-gnu", "lib64", "lib"] {
+        let d = p.join(sub);
+        if d.is_dir() {
+            libs.push(d.to_string_lossy().into_owned());
+        }
+    }
+    if libs.is_empty() {
+        Vec::new()
+    } else {
+        vec![("LD_LIBRARY_PATH".to_string(), libs.join(":"))]
+    }
 }
 
 fn cmd_boot(args: &[String]) -> ExitCode {
