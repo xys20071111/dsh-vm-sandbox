@@ -7,6 +7,9 @@ echo "SETUP: args=$# [$1|$2|$3] agent-marker=$(grep -c dsh-vm-agent /dsh-setup)"
 MODE="${1:-rw}"
 WS="${2:?workspace host path required}"
 AGENT="${3:-}"
+shift 3 || true
+# Backend restricts share names to whitespace-free safe tokens.
+MOUNT_NAMES="$*"
 
 set -e
 
@@ -62,7 +65,20 @@ for c in "$@"; do
 done
 mount -t virtiofs workspace "$P"
 
-# 5/6. 进入合成根：agent 模式常驻（VM 随 agent 退出而关机），否则执行一次性验证负载
+# Restore the validated extra share names; the path walk above reused positional args.
+set -- $MOUNT_NAMES
+# 5. Additional host shares: tags are validated by the host backend; mount RO in guest.
+#    The virtiofs daemon also enforces RO at the host FUSE operation layer, so a guest
+#    remount cannot make backing data writable (though this is not a general isolation boundary).
+if [ "$#" -gt 0 ]; then
+  mkdir -p /run/newroot/mnt/dsh-shares
+  for name in "$@"; do
+    mkdir -p "/run/newroot/mnt/dsh-shares/$name"
+    mount -t virtiofs -o ro "$name" "/run/newroot/mnt/dsh-shares/$name"
+  done
+fi
+
+# 6/7. 进入合成根：agent 模式常驻（VM 随 agent 退出而关机），否则执行一次性验证负载
 if [ "$AGENT" = agent ]; then
   echo "SETUP: agent branch taken"
   chroot /run/newroot /usr/bin/dsh-vm-agent

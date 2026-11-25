@@ -16,6 +16,8 @@
   },
   "files": [
     "index.js",
+    "guest-files.js",
+    "dns-settings.js",
     "terminal-backend.js",
     "client.js",
     "cordis.patch.yml",

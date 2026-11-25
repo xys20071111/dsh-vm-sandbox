@@ -46,7 +46,7 @@ fn main() -> ExitCode {
 fn usage() -> ! {
     eprintln!("usage: krun-backend <probe|boot|exec|serve> [options]");
     eprintln!("  probe");
-    eprintln!("  boot --rootfs <p> [--console <f>] [--vcpus <n>] [--ram <mib>] [--agent-sock <p>] [--setup ro|rw] [--ws-path <p>] [--data-img <p>] [--data-format raw|qcow2] [--network tsi|none] [--port-map host:guest] [--forward host:guest] -- <command...>");
+    eprintln!("  boot --rootfs <p> [--console <f>] [--vcpus <n>] [--ram <mib>] [--agent-sock <p>] [--setup ro|rw] [--ws-path <p>] [--mount <name> <host-path>]... [--data-img <p>] [--data-format raw|qcow2] [--network tsi|none] [--port-map host:guest] [--forward host:guest] -- <command...>");
     eprintln!("    --forward host:guest  应用层端口转发（重复可叠）：额外 vsock 端口桥接 UNIX socket（<agent-sock>.fwd<N>），");
     eprintln!("                          agent 中继到 guest 127.0.0.1:<guest>；宿主侧由 provider/serve 起 TCP 监听（none 档零占用组合）");
     eprintln!("  exec --socket <p> [--cwd <d>] -- <argv...>");
@@ -342,6 +342,7 @@ fn cmd_boot(args: &[String]) -> ExitCode {
     let mut setup_mode: Option<String> = None; // Some("ro"|"rw") 时走 guest 内编排路径
     let mut setup_script = String::from("setup.sh");
     let mut ws_path: Option<String> = None;
+    let mut mounts: Vec<(String, String)> = Vec::new();
     let mut data_img: Option<String> = None;
     let mut agent_sock: Option<String> = None;
     let mut port_map: Vec<String> = Vec::new();
@@ -359,6 +360,12 @@ fn cmd_boot(args: &[String]) -> ExitCode {
             "--setup" => { setup_mode = Some(args.get(i + 1).expect("--setup needs a value").clone()); i += 2; }
             "--setup-script" => { setup_script = args.get(i + 1).expect("--setup-script needs a value").clone(); i += 2; }
             "--ws-path" => { ws_path = Some(args.get(i + 1).expect("--ws-path needs a value").clone()); i += 2; }
+            "--mount" => {
+                let name = args.get(i + 1).expect("--mount needs a name").clone();
+                let path = args.get(i + 2).expect("--mount needs a host path").clone();
+                mounts.push((name, path));
+                i += 3;
+            }
             "--data-img" => { data_img = Some(args.get(i + 1).expect("--data-img needs a value").clone()); i += 2; }
             "--data-format" => { data_format = args.get(i + 1).expect("--data-format needs a value").clone(); i += 2; }
             "--agent-sock" => { agent_sock = Some(args.get(i + 1).expect("--agent-sock needs a value").clone()); i += 2; }
@@ -400,9 +407,32 @@ fn cmd_boot(args: &[String]) -> ExitCode {
         api::add_virtiofs(ctx, "/dev/root", &rootfs, 0, true, api::KRUN_SEMANTICS_LINUX_SIMPLIFIED)
             .expect("add_virtiofs root (ro)");
         let ws = ws_path.clone().unwrap_or_else(|| { eprintln!("boot: --ws-path is required with --setup"); usage(); });
+        if mode != "ro" && mode != "rw" {
+            eprintln!("boot: --setup expects ro|rw, got {mode}");
+            usage();
+        }
+        let mut seen_mount_names = std::collections::HashSet::new();
+        for (name, path) in &mounts {
+            if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.') || name == "." || name == ".." || name == "workspace" || name == "/dev/root" {
+                eprintln!("boot: invalid mount name {name:?} (use ASCII letters, digits, _, -, .; not . or ..)");
+                usage();
+            }
+            if !seen_mount_names.insert(name) {
+                eprintln!("boot: duplicate mount name {name:?}");
+                usage();
+            }
+            if !std::path::Path::new(path).is_absolute() {
+                eprintln!("boot: mount host path must be absolute: {path:?}");
+                usage();
+            }
+        }
         let ws_ro = mode == "ro";
         api::add_virtiofs(ctx, "workspace", &ws, 0, ws_ro, api::KRUN_SEMANTICS_LINUX_SIMPLIFIED)
             .expect("add_virtiofs workspace");
+        for (name, path) in &mounts {
+            api::add_virtiofs(ctx, name, path, 0, true, api::KRUN_SEMANTICS_LINUX_SIMPLIFIED)
+                .unwrap_or_else(|err| { eprintln!("krun-backend: add_virtiofs share {name}: {err}"); std::process::exit(1); });
+        }
         if let Some(di) = &data_img {
             // 数据层盘（virtio-blk）：overlayfs-on-ext4 是内核经典支持路径；qcow2 为
             // 快照/克隆友好的可选容器格式（文件系统均由 guest 内挂载，见 setup.sh）。
@@ -447,8 +477,10 @@ fn cmd_boot(args: &[String]) -> ExitCode {
             }
         }
         let mut args_refs: Vec<&str> = vec!["/dsh-setup", mode, ws.as_str()];
-        if agent_sock.is_some() {
-            args_refs.push("agent");
+        args_refs.push(if agent_sock.is_some() { "agent" } else { "-" });
+        // setup.sh mount token list starts at $4; a sentinel preserves the index without agent mode.
+        for (name, _) in &mounts {
+            args_refs.push(name);
         }
         let mut envp: Vec<String> = vec!["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into(), "HOME=/root".into(), "TERM=xterm-256color".into()];
         if !forward_env.is_empty() {

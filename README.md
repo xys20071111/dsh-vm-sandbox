@@ -21,13 +21,14 @@
 - **侧栏终端**：GUI"新建终端"shell 选择器里的 `krun` 项（`plugin/bin/krun` 桥，
   OSC 7777 resize 直达 guest PTY，会话未运行自动引导）
 - **网络档按工作区**：全局默认 + 工作区绑定覆盖（tsi/none，管理页选择器/`workspaces/network` API），
-  档位变化自动停旧启新；`portMap: ["host:guest"]` = vsock 应用层转发（宿主绑 127.0.0.1），
+  档位变化自动停旧启新；全局 DNS 可在管理页设置 IPv4/IPv6 DNS 地址，持久化到 `<dataDir>/dns.json`，VM 启动前写入 guest `/etc/resolv.conf`（强制 TCP DNS 以兼容 TSI）；留空使用宿主 `resolv.conf` 的 DNS；`portMap: ["host:guest"]` = vsock 应用层转发（宿主绑 127.0.0.1），
   `none` 档下即"零占用 + 只暴露指定端口"组合
 - **qcow2 数据层**：`dataDiskFormat: 'qcow2'`（qemu-img 建盘，guest 内首启格式化）
 - **诊断 skill**：`diagnose-krun-vm-sandbox`（全局 skill，排障路径 + 常见失败表）
 - **会话守护进程**：`serve`（默认开启，`daemon: false` 回退直 spawn）——跨进程共享会话
   （同 dataDir 的 live/headless 共用一 VM）、配置指纹漂移防线、boot 子进程监督、PDEATHSIG 孤儿回收
-- **管理页**：Settings → "VM sandbox"（环境体检 / 运行会话 / 镜像 / 工作区绑定）+ composer 状态芯片
+- **管理页**：侧栏独立的“虚拟机管理”（环境/会话/镜像看板、工作区镜像绑定与网络档、额外只读目录挂载、虚拟机专用文件管理）+ composer 状态芯片。文件管理仅作用于 guest 持久目录 `/root/vm-files`，不会读写宿主文件系统；单文件传输上限 64 KiB（受 guest exec argv 长度限制）。
+- **Agent rootfs 选择与 VM 创建**：`krun_vm` 工具列出可选镜像并允许 Agent 为当前工作区绑定所选 rootfs、设置网络/ro-rw 并启动 VM；只接受管理的镜像 ID，不接收任意宿主路径或 URL。无导入镜像时可用已配置 rootfs 或官方 Alpine 自动回退。
 
 ## 布局
 
@@ -37,7 +38,7 @@
 | `backend/krun-backend/` | 宿主侧 Rust：`probe` / `boot`（每会话一 VM 子进程，PDEATHSIG 绑父）/ `exec`（agent 客户端，exec2 帧解包）/ `serve`（**会话守护进程**：注册表/监督/gc/端口转发监听，协议见 serve.rs） |
 | `backend/guest/dsh-vm-agent/` | guest 内代理（musl static-pie）：vsock:42 上的 exec（fork/execve + env 透传）、exec2（stdout/stderr/退出码帧分离）、term（PTY + OSC 7777 resize）、vsock 端口转发中继、stat（活跃连接）；全 fd CLOEXEC |
 | `backend/vendor/libkrun/` | **git submodule**：containers/libkrun `stable-1.19.x`，锁定 1.19.8 发布点（c4d283c2）；path 依赖 `src/libkrun`，可打补丁 |
-| `plugin/` | `@local/dsh-krun-vm` 插件：`index.js`（SandboxProvider + /vm 命令 + 镜像管理路由 + 端口转发监听 + 空闲回收）、`diagnose-skill.js`（诊断 skill）、`terminal-backend.js`（persistent-shell 组内注册器）、`client.js`（设置页四卡 + 预设清单 + 状态芯片）、`guest/setup.sh`（guest 内三层编排 + 首启格式化）、`bin/krun`（侧栏终端桥）、`bin/krun-backend`、`guest/dsh-vm-agent{-aarch64,}`（构建产物，已忽略） |
+| `plugin/` | `@local/dsh-krun-vm` 插件：`index.js`（SandboxProvider + /vm 命令 + 管理 API + 端口转发监听 + 空闲回收）、`guest-files.js`（VM 内安全文件操作）、`diagnose-skill.js`（诊断 skill）、`terminal-backend.js`（persistent-shell 组内注册器）、`client.js`（侧栏虚拟机管理、文件/挂载页面 + 状态芯片）、`guest/setup.sh`（guest 内三层编排 + 首启格式化）、`bin/krun`（侧栏终端桥）、`bin/krun-backend`、`guest/dsh-vm-agent{-aarch64,}`（构建产物，已忽略） |
 | `m0/` | 可行性尖峰：FFI 探针 / 引导冒烟（koffi 路线已弃用的实证） |
 | `harness/` | 接线工件：`krun-overlay.yml`（dsh --patch 用）、`krun-preset-override.yml`（三预设覆写生成物）、`krun-overlay-headless-*.yml`（headless 验证 overlay） |
 | `scripts/build.sh` | 构建并部署二进制到 `plugin/`（x86_64 + best-effort aarch64 agent） |

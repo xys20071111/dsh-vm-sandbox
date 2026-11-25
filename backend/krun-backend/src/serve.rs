@@ -92,6 +92,13 @@ struct ForwardParam {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct MountParam {
+    name: String,
+    path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct EnsureParams {
     key: String,
     ws: String,
@@ -109,6 +116,8 @@ struct EnsureParams {
     log_path: String,
     #[serde(default)]
     forwards: Vec<ForwardParam>,
+    #[serde(default)]
+    mounts: Vec<MountParam>,
     fingerprint: String,
 }
 
@@ -191,6 +200,11 @@ fn build_boot_args(p: &EnsureParams) -> Vec<String> {
     for f in &p.forwards {
         args.push("--forward".into());
         args.push(format!("{}:{}", f.host, f.guest));
+    }
+    for mount in &p.mounts {
+        args.push("--mount".into());
+        args.push(mount.name.clone());
+        args.push(mount.path.clone());
     }
     args
 }

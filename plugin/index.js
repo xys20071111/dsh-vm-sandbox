@@ -25,6 +25,8 @@ import { homedir, tmpdir } from 'node:os';
 import { SandboxProvider, SandboxUnavailableError, canonicalPath } from '@deepseek-ai/dsh-sandbox';
 import z from '@deepseek-ai/schemastery';
 import { KRUN_DIAGNOSIS_SKILL } from './diagnose-skill.js';
+import { GuestFiles } from './guest-files.js';
+import { normalizeDnsServers, readDnsSettings, resolveHostDnsServers, writeDnsSettings, writeGuestResolvConf } from './dns-settings.js';
 
 const PKG_DIR = dirname(fileURLToPath(import.meta.url));
 const GUEST_AGENT = join(PKG_DIR, 'guest', 'dsh-vm-agent-x86_64');
@@ -345,6 +347,8 @@ export class KrunSandboxProvider extends SandboxProvider {
      *  none = 隔离（vsock 控制通道保留，宿主零端口占用）。
      *  本版 schemastery 无 enumerator，枚举 = union(const)。 */
     network: z.union([z.const('tsi'), z.const('none')]).default('tsi'),
+    /** 全局 DNS 服务器 IP 列表；空数组表示使用宿主 resolv.conf 中 nameserver。 */
+    dnsServers: z.array(z.string()).default([]),
     /** 显式端口映射 ["host:guest", …]：应用层端口转发（vsock 通道，宿主监听 127.0.0.1:<host>）。
      *  network=none 档下的"零宿主端口占用 + 只暴露指定端口"组合即由此实现；
      *  tsi 档自动暴露之外这是额外直达通道。空 = 无转发。 */
@@ -371,6 +375,7 @@ export class KrunSandboxProvider extends SandboxProvider {
     this.krunConfig = config;
     this.krunCtx = ctx;
     this.krunDataDir = resolveDataDir(config, (m) => this.krunDiag(m));
+    this.krunDnsServers = readDnsSettings(this.krunDataDir, config.dnsServers ?? []);
     this.krunBackendPath = expandHome(config.backendPath || join(PKG_DIR, 'bin', 'krun-backend'));
     // 工具自持：dataDir/tools 内若放着 libkrunfw 预构建包，激活时自动解包到 tools/lib
     this.krunAutoInstallTools();
@@ -395,6 +400,10 @@ export class KrunSandboxProvider extends SandboxProvider {
     ctx.inject(['commands'], (injectCtx) => {
       this.krunDiag('commands inject callback fired');
       this.krunRegisterCommands(injectCtx);
+    });
+    ctx.inject(['tools'], (injectCtx) => {
+      this.krunDiag('tools inject callback fired');
+      this.krunRegisterAgentTools(injectCtx.tools);
     });
     // 诊断 skill（仿 windows-acl）：skills 注册表根作用域可用，内联 runtime 注册。
     ctx.inject(['skills'], (injectCtx) => {
@@ -423,10 +432,19 @@ export class KrunSandboxProvider extends SandboxProvider {
       res.writeHead(code, { 'content-type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify(body));
     };
-    const readBody = (req) => new Promise((res) => {
+    const readBody = (req) => new Promise((resolve) => {
       let raw = '';
-      req.on('data', (c) => { raw += c; });
-      req.on('end', () => { try { res(JSON.parse(raw || '{}')); } catch { res({}); } });
+      let tooLarge = false;
+      req.on('data', (chunk) => {
+        if (tooLarge) return;
+        raw += chunk;
+        if (raw.length > 4 * 1024 * 1024) { tooLarge = true; raw = ''; }
+      });
+      req.on('end', () => {
+        if (tooLarge) { resolve({ __error: 'request body too large' }); return; }
+        try { resolve(JSON.parse(raw || '{}')); } catch { resolve({ __error: 'invalid JSON body' }); }
+      });
+      req.on('error', () => resolve({ __error: 'request body failed' }));
     });
     this.krunStatusSnapshot = () => ({
       ok: true,
@@ -438,6 +456,7 @@ export class KrunSandboxProvider extends SandboxProvider {
         imageRootfs: this.krunConfig.imageRootfs,
         idleStopMs: this.krunConfig.idleStopMs,
         network: this.krunConfig.network,
+        dnsServers: this.krunDnsServers,
         portMap: this.krunConfig.portMap ?? [],
         dataDiskFormat: this.krunConfig.dataDiskFormat ?? 'raw',
         resources: this.krunConfig.resources,
@@ -478,6 +497,27 @@ export class KrunSandboxProvider extends SandboxProvider {
     }, 'krun-vm: GET /api/krun/status');
     registerRoute({
       kind: 'exact',
+      path: '/api/krun/dns',
+      handler: async (req, res) => {
+        if (req.method !== 'POST') { res.writeHead(405); res.end(); return; }
+        const body = await readBody(req);
+        if (body.__error) { sendJson(res, 413, { ok: false, err: body.__error }); return; }
+        try {
+          const servers = normalizeDnsServers(body.dnsServers);
+          this.krunDnsServers = writeDnsSettings(this.krunDataDir, servers);
+          // Drain in-flight boots before stopping sessions so the next VM always receives
+          // the newly selected resolv.conf, including in daemon and legacy modes.
+          await Promise.allSettled([...this.booting.values()]);
+          await this.stopAll();
+          this.krunDiag(`DNS servers updated: ${servers.length ? servers.join(', ') : '(host resolver)'}`);
+          sendJson(res, 200, { ok: true, dnsServers: servers });
+        } catch (err) {
+          sendJson(res, 400, { ok: false, err: String(err?.message ?? err) });
+        }
+      },
+    }, 'krun-vm: POST /api/krun/dns');
+    registerRoute({
+      kind: 'exact',
       path: '/api/krun/stop',
       handler: async (req, res) => {
         if (req.method !== 'POST') { res.writeHead(405); res.end(); return; }
@@ -497,6 +537,19 @@ export class KrunSandboxProvider extends SandboxProvider {
         sendJson(res, 200, { ok: true, probe: (await this.probe()) });
       },
     }, 'krun-vm: POST /api/krun/probe');
+    registerRoute({
+      kind: 'exact',
+      path: '/api/krun/create',
+      handler: async (req, res) => {
+        if (req.method !== 'POST') { res.writeHead(405); res.end(); return; }
+        const body = await readBody(req);
+        if (body.__error) { sendJson(res, 413, { ok: false, err: body.__error }); return; }
+        try {
+          const result = await this.krunCreateVm({ ws: String(body.ws ?? ''), imageId: body.imageId, network: body.network, mode: body.mode });
+          sendJson(res, 200, { ok: true, ...result });
+        } catch (err) { sendJson(res, 400, { ok: false, err: String(err?.message ?? err) }); }
+      },
+    }, 'krun-vm: POST /api/krun/create');
     registerRoute({
       kind: 'exact',
       path: '/api/krun/ensure',
@@ -617,11 +670,13 @@ export class KrunSandboxProvider extends SandboxProvider {
           return;
         }
         const reg = REGISTRY.read(this.krunDataDir);
-        const entry = { imageId, boundAt: new Date().toISOString() };
+        const previous = reg.workspaces[ws];
+        const entry = { imageId, boundAt: new Date().toISOString(), ...(previous?.mounts ? { mounts: previous.mounts } : {}) };
         const net = body.network === 'tsi' || body.network === 'none' ? body.network : undefined;
         if (net) entry.network = net;
         reg.workspaces[ws] = entry;
         REGISTRY.write(this.krunDataDir, reg);
+        await this.krunStopWorkspaceSessions(ws);
         this.krunInvalidateWsCache(ws);
         this.krunDiag(`bind ${ws} -> ${imageId}${net ? ` (network ${net})` : ''}`);
         sendJson(res, 200, { ok: true });
@@ -647,11 +702,73 @@ export class KrunSandboxProvider extends SandboxProvider {
           delete reg.workspaces[ws].network; // 恢复全局默认
         }
         REGISTRY.write(this.krunDataDir, reg);
+        await this.krunStopWorkspaceSessions(ws);
         this.krunInvalidateWsCache(ws);
         this.krunDiag(`workspace network ${ws} -> ${net || '(default)'}`);
         sendJson(res, 200, { ok: true });
       },
     }, 'krun-vm: POST /api/krun/workspaces/network');
+    registerRoute({
+      kind: 'exact',
+      path: '/api/krun/workspaces/mounts',
+      handler: async (req, res) => {
+        if (req.method !== 'POST') { res.writeHead(405); res.end(); return; }
+        const body = await readBody(req);
+        if (body.__error) { sendJson(res, 413, { ok: false, err: body.__error }); return; }
+        const ws = String(body.ws ?? '');
+        if (!ws.startsWith('/')) { sendJson(res, 400, { ok: false, err: 'ws must be an absolute path' }); return; }
+        if (!Array.isArray(body.mounts) || body.mounts.length > 16) { sendJson(res, 400, { ok: false, err: 'mounts must be an array of at most 16 folders' }); return; }
+        try {
+          const fs = await import('node:fs/promises');
+          const names = new Set();
+          const mounts = [];
+          for (const item of body.mounts) {
+            const name = String(item?.name ?? '');
+            const hostPath = expandHome(String(item?.path ?? ''));
+            if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,47}$/.test(name) || name === 'workspace' || names.has(name)) throw new Error(`invalid, reserved, or duplicate mount name: ${name}`);
+            names.add(name);
+            if (!hostPath.startsWith('/')) throw new Error(`mount path must be absolute: ${hostPath || '(empty)'}`);
+            const resolved = await fs.realpath(hostPath);
+            if (!(await fs.stat(resolved)).isDirectory()) throw new Error(`not a directory: ${resolved}`);
+            mounts.push({ name, path: resolved });
+          }
+          const reg = REGISTRY.read(this.krunDataDir);
+          reg.workspaces[ws] = { ...(reg.workspaces[ws] ?? { imageId: null, boundAt: new Date().toISOString() }), mounts };
+          REGISTRY.write(this.krunDataDir, reg);
+          await this.krunStopWorkspaceSessions(ws);
+          this.krunInvalidateWsCache(ws);
+          sendJson(res, 200, { ok: true, mounts });
+        } catch (err) { sendJson(res, 400, { ok: false, err: String(err?.message ?? err) }); }
+      },
+    }, 'krun-vm: POST /api/krun/workspaces/mounts');
+    registerRoute({
+      kind: 'exact',
+      path: '/api/krun/files',
+      handler: async (req, res) => {
+        if (req.method !== 'POST') { res.writeHead(405); res.end(); return; }
+        const body = await readBody(req);
+        if (body.__error) { sendJson(res, 413, { ok: false, err: body.__error }); return; }
+        const session = this.sessions.get(String(body.key ?? ''));
+        if (!session || (session.daemonManaged ? false : session.child.killed)) { sendJson(res, 404, { ok: false, err: 'VM session is not running' }); return; }
+        try {
+          const files = new GuestFiles({ exec: async (argv) => {
+            const { stdout } = await new Promise((resolve, reject) => execFile(this.krunBackendPath, ['exec', '--socket', session.agentSock, '--cwd', '/', '--', ...argv], { timeout: 15000, maxBuffer: 3 * 1024 * 1024 }, (err, stdout, stderr) => err ? reject(new Error(stderr || err.message)) : resolve({ stdout })));
+            return stdout;
+          } });
+          const action = String(body.action ?? 'list');
+          let result;
+          if (action === 'list') result = await files.list(body.path ?? '');
+          else if (action === 'read') result = await files.read(body.path ?? '');
+          else if (action === 'write') result = await files.write(body.path ?? '', String(body.data ?? ''), { overwrite: body.overwrite !== false });
+          else if (action === 'mkdir') result = await files.mkdir(body.path ?? '');
+          else if (action === 'rename') result = await files.rename(body.path ?? '', String(body.to ?? ''), { overwrite: body.overwrite === true });
+          else if (action === 'remove') result = await files.remove(body.path ?? '');
+          else throw new Error('unsupported action');
+          session.lastUse = Date.now();
+          sendJson(res, 200, { ok: true, result });
+        } catch (err) { sendJson(res, 400, { ok: false, err: String(err?.message ?? err) }); }
+      },
+    }, 'krun-vm: POST /api/krun/files');
     registerRoute({
       kind: 'exact',
       path: '/api/krun/workspaces/unbind',
@@ -831,6 +948,83 @@ export class KrunSandboxProvider extends SandboxProvider {
     return { ok: true, stopped, removed };
   }
 
+  /** Agent-facing rootfs discovery and VM creation. Workspace is derived from the caller. */
+  krunRegisterAgentTools(tools) {
+    const dispose = tools.register({
+      name: 'krun_vm',
+      description: 'Discover available VM rootfs images and create/start a libkrun VM for your current workspace. First call action=list_rootfs. To choose an image, call action=create_vm with one returned imageId. If the list is empty, omit imageId to use the workspace binding, configured imageRootfs, or safe built-in Alpine fallback. Only registered image IDs are selectable; no host path or arbitrary URL is accepted.',
+      parameters: {
+        type: 'object',
+        properties: {
+          action: { type: 'string', enum: ['list_rootfs', 'create_vm'], description: 'List selectable rootfs images or bind a selected image and start its VM.' },
+          imageId: { type: 'string', description: 'Optional for create_vm; choose an id returned by list_rootfs, or omit to use the existing/default image.' },
+          network: { type: 'string', enum: ['tsi', 'none'], description: 'Optional workspace network mode; defaults to the configured mode.' },
+          mode: { type: 'string', enum: ['rw', 'ro'], description: 'Optional VM workspace mode; defaults to rw.' },
+        },
+        required: ['action'],
+        additionalProperties: false,
+      },
+      output: {
+        schema: { type: 'object', additionalProperties: true },
+        render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
+      },
+      timeoutMs: 120000,
+      execute: async (args, exec) => {
+        try {
+          if (!exec.agent) throw new Error('an active Agent session is required');
+          const ws = await this.krunWorkingDirectory.ensure(exec.agent, exec.signal);
+          if (args.action === 'list_rootfs') return await this.krunListRootfsForAgent(ws);
+          if (args.action === 'create_vm') return await this.krunCreateVm({ ws, imageId: args.imageId, network: args.network, mode: args.mode, signal: exec.signal });
+          throw new Error('action must be list_rootfs or create_vm');
+        } catch (err) { throw new Error(`krun_vm: ${err?.message ?? err}`); }
+      },
+    });
+    this.krunCtx.effect(() => dispose, 'krun-vm: Agent tool');
+  }
+
+  async krunListRootfsForAgent(ws) {
+    const images = this.krunListImages().filter((image) => !image.error && existsSync(join(this.krunImagesDir(), image.id, 'rootfs')));
+    const configured = expandHome(this.krunConfig.imageRootfs);
+    return {
+      workspace: ws,
+      selectedImageId: REGISTRY.read(this.krunDataDir).workspaces[ws]?.imageId ?? null,
+      images: images.map(({ id, name, distro, arch, sizeBytes, bashReady, refCount }) => ({ id, name, distro, arch, sizeBytes, bashReady, refCount })),
+      fallback: images.length ? null : (configured && existsSync(configured) ? { kind: 'configured-imageRootfs', willBeImportedOnCreate: true } : { kind: 'auto-alpine-minirootfs', description: 'The backend will bootstrap the official Alpine minirootfs if no image is selected.' }),
+    };
+  }
+
+  async krunCreateVm({ ws, imageId, network, mode = 'rw', signal }) {
+    signal?.throwIfAborted();
+    if (typeof ws !== 'string' || !ws.startsWith('/') || ws.includes('\0')) throw new Error('workspace must be an absolute path');
+    if (!['rw', 'ro'].includes(mode)) throw new Error('mode must be rw or ro');
+    if (network !== undefined && !['tsi', 'none'].includes(network)) throw new Error('network must be tsi or none');
+    let selected;
+    if (imageId !== undefined && imageId !== null && imageId !== '') {
+      if (typeof imageId !== 'string' || !/^[A-Za-z0-9_-]+$/.test(imageId)) throw new Error('invalid imageId');
+      const rootfs = join(this.krunImagesDir(), imageId, 'rootfs');
+      const manifestPath = join(this.krunImagesDir(), imageId, 'manifest.json');
+      if (!existsSync(rootfs) || !existsSync(manifestPath)) throw new Error(`unknown rootfs image id: ${imageId}`);
+      const reg = REGISTRY.read(this.krunDataDir);
+      const previous = reg.workspaces[ws] ?? { imageId: null, boundAt: new Date().toISOString() };
+      const binding = { ...previous, imageId };
+      if (network) binding.network = network;
+      reg.workspaces[ws] = binding;
+      REGISTRY.write(this.krunDataDir, reg);
+      selected = { imageId, rootfs };
+      await this.krunStopWorkspaceSessions(ws);
+      this.krunInvalidateWsCache(ws);
+    } else if (network) {
+      const reg = REGISTRY.read(this.krunDataDir);
+      reg.workspaces[ws] = { ...(reg.workspaces[ws] ?? { imageId: null, boundAt: new Date().toISOString() }), network };
+      REGISTRY.write(this.krunDataDir, reg);
+      await this.krunStopWorkspaceSessions(ws);
+      this.krunInvalidateWsCache(ws);
+    }
+    const session = await this.ensureSession({ mode: mode === 'ro' ? 'read-only' : 'workspace-write', workspaceRoot: ws }, signal);
+    session.lastUse = Date.now();
+    return { workspace: session.ws, imageId: selected?.imageId ?? basename(dirname(session.image)), image: session.image, key: session.key, mode: session.mode, network: session.network ?? network ?? this.krunWorkspaceSettings(session.ws).network, started: true };
+  }
+
   /** /vm 命令组（设计 §8.2）：一个注册项解析 status|stop|reset 三个子命令。 */
   krunRegisterCommands(injectCtx) {
     const def = {
@@ -988,7 +1182,7 @@ export class KrunSandboxProvider extends SandboxProvider {
       ? binding.network
       : this.krunConfig.network;
     const image = this.krunResolveImage(ws);
-    return { image, network, binding };
+    return { image, network, binding, mounts: binding?.mounts ?? [] };
   }
 
   /** 激活期工具自持：<dataDir>/tools/ 下的 libkrunfw tgz 自动解包到 tools/lib。
@@ -1031,8 +1225,14 @@ export class KrunSandboxProvider extends SandboxProvider {
   /** 工作区设置变更后失效本实例的会话缓存：下次 ensure 重新走指纹比对，
    *  档位/镜像变化的会话由守护进程停旧启新。 */
   krunInvalidateWsCache(ws) {
-    for (const mode of ['ro', 'rw']) {
-      this.sessions.delete(sessionKey(ws, mode));
+    for (const mode of ['ro', 'rw']) this.sessions.delete(sessionKey(ws, mode));
+  }
+
+  async krunStopWorkspaceSessions(ws) {
+    await this.krunRefreshSessions().catch(() => {});
+    for (const s of [...this.sessions.values()]) {
+      if (s.ws !== canonicalPath(ws)) continue;
+      await this.krunStopSession(s.key);
     }
   }
 
@@ -1100,11 +1300,8 @@ export class KrunSandboxProvider extends SandboxProvider {
     chmodSync(agentDst, 0o755);
     writeFileSync(setupDst, readFileSync(GUEST_SETUP));
     chmodSync(setupDst, 0o755);
-    // DNS：minirootfs 不带 resolv.conf；tsi 档共享宿主网络（宿主 resolver 经代理可达），
-    // 原样拷贝宿主 resolv.conf。none 档无网络，此文件无副作用。
-    try {
-      writeFileSync(join(imageRootfs, 'etc', 'resolv.conf'), readFileSync('/etc/resolv.conf'));
-    } catch { /* 宿主无 resolv.conf 时跳过 */ }
+    // RO sessions cannot create these below the merged root, so bake mountpoints into the lower image.
+    mkdirSync(join(imageRootfs, 'mnt', 'dsh-shares'), { recursive: true });
   }
 
   /** 会话守护进程连接（懒建；失败重 spawn，ping 为就绪判据）。单连接 + 调用串行队列。 */
@@ -1301,22 +1498,42 @@ export class KrunSandboxProvider extends SandboxProvider {
     }
     const imageRootfs = resolved.rootfs;
     this.bakeGuestFiles(imageRootfs);
+    const { network, mounts: configuredMounts } = this.krunWorkspaceSettings(ws);
+    if (!Array.isArray(configuredMounts) || configuredMounts.length > 16) throw new SandboxUnavailableError(policy.mode, 'invalid workspace mount configuration');
+    const fs = await import('node:fs/promises');
+    const mountNames = new Set();
+    const mounts = [];
+    for (const mount of configuredMounts) {
+      const name = String(mount?.name ?? '');
+      const hostPath = String(mount?.path ?? '');
+      if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,47}$/.test(name) || name === 'workspace' || name === '/dev/root' || mountNames.has(name) || !hostPath.startsWith('/')) {
+        throw new SandboxUnavailableError(policy.mode, `invalid workspace mount: ${name || '(unnamed)'}`);
+      }
+      mountNames.add(name);
+      const resolvedPath = await fs.realpath(hostPath);
+      if (!(await fs.stat(resolvedPath)).isDirectory()) throw new SandboxUnavailableError(policy.mode, `workspace mount is not a directory: ${resolvedPath}`);
+      mkdirSync(join(imageRootfs, 'mnt', 'dsh-shares', name), { recursive: true });
+      mounts.push({ name, path: resolvedPath });
+    }
+    const dnsServers = this.krunDnsServers.length
+      ? this.krunDnsServers
+      : resolveHostDnsServers().slice(0, 6);
+    writeGuestResolvConf(imageRootfs, dnsServers.length ? dnsServers : ['127.0.0.53']);
     // qcow2 数据层首次启动在 guest 内格式化：镜像缺 e2fsprogs 时按需补装（宿主网络，幂等）
     if ((this.krunConfig.dataDiskFormat ?? 'raw') === 'qcow2') {
       const pkgs = await ensureGuestPackages(imageRootfs, ['e2fsprogs']);
       if (pkgs.warning) this.krunDiag(`guest pkgs warning: ${pkgs.warning}`);
     }
 
-    const { network } = this.krunWorkspaceSettings(ws);
     if (this.krunConfig.daemon ?? true) {
-      return this.bootSessionViaDaemon({ key, ws, mode, policy }, imageRootfs, network);
+      return this.bootSessionViaDaemon({ key, ws, mode, policy }, imageRootfs, network, mounts);
     }
-    return this.bootSessionDirect({ key, ws, mode, policy }, imageRootfs, signal, network);
+    return this.bootSessionDirect({ key, ws, mode, policy }, imageRootfs, signal, network, mounts);
   }
 
   /** daemon 模式：引导委托给 serve 守护进程（会话注册表/监督/gc/转发监听都在那边）。
    *  network = 工作区覆盖档位（krunWorkspaceSettings），进指纹——档位变化自动停旧启新。 */
-  async bootSessionViaDaemon({ key, ws, mode, policy }, imageRootfs, network) {
+  async bootSessionViaDaemon({ key, ws, mode, policy }, imageRootfs, network, mounts = []) {
     const runDir = join(this.krunDataDir, 'run');
     const logDir = join(this.krunDataDir, 'logs');
     const sockPath = join(runDir, `${key}.sock`);
@@ -1336,6 +1553,7 @@ export class KrunSandboxProvider extends SandboxProvider {
         ram: this.krunConfig.resources.ramMib,
         network,
         portMap: this.krunConfig.portMap ?? [],
+        mounts,
         dataFormat: this.krunConfig.dataDiskFormat ?? 'raw',
         dataImg,
       }))
@@ -1347,6 +1565,7 @@ export class KrunSandboxProvider extends SandboxProvider {
       vcpus: this.krunConfig.resources.vcpus,
       ram: this.krunConfig.resources.ramMib,
       network,
+      mounts,
       dataImg,
       dataFormat: this.krunConfig.dataDiskFormat ?? 'raw',
       agentSock: sockPath,
@@ -1376,7 +1595,7 @@ export class KrunSandboxProvider extends SandboxProvider {
   }
 
   /** 遗留直 spawn 路径（daemon:false）：一 VM 一子进程，provider 自管注册表/转发监听。 */
-  async bootSessionDirect({ key, ws, mode, policy }, imageRootfs, signal, network) {
+  async bootSessionDirect({ key, ws, mode, policy }, imageRootfs, signal, network, mounts = []) {
     const runDir = join(this.krunDataDir, 'run');
     const logDir = join(this.krunDataDir, 'logs');
     const sockPath = join(runDir, `${key}.sock`);
@@ -1402,6 +1621,7 @@ export class KrunSandboxProvider extends SandboxProvider {
       confineArgs.push('--data-img', img);
     }
     if (network === 'none') confineArgs.push('--network', 'none');
+    for (const mount of mounts) confineArgs.push('--mount', mount.name, mount.path);
     for (const pm of this.krunConfig.portMap ?? []) confineArgs.push('--forward', pm);
     if ((this.krunConfig.dataDiskFormat ?? 'raw') === 'qcow2') confineArgs.push('--data-format', 'qcow2');
 
