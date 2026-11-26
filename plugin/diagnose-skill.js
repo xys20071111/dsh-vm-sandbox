@@ -53,7 +53,7 @@ prove idle-recycle reboots (normal). Common endings:
 | \`add_vsock_port agent: -17\` / EEXIST | stale socket file was not cleaned — provider removes it before boot; if you boot manually, \`rm\` the stale \`run/<key>.sock\` first |
 | \`mke2fs failed\` / \`spawn …mke2fs\` | host e2fsprogs missing for a raw data layer (\`KRUN_MKE2FS\` env or install e2fsprogs) |
 | \`spawn qemu-img\` | qcow2 data layer requires host \`qemu-img\` (qemu-utils) |
-| \`mkfs.ext4: not found\` (guest) | image lacks e2fsprogs for qcow2 first-boot formatting — provider auto-installs on alpine; glibc images must ship it |
+| \`missing e2fsprogs\` (guest) | an empty qcow2 data disk needs \`mkfs.ext4\` or \`mke2fs\` in the rootfs before VM startup; add the package to the image. |
 | \`Read-only file system\` in \`ro\` sessions | expected EROFS denial, not a fault |
 | setup lines end without agent listening | guest orchestration failed — read upward from the last SETUP line |
 | \`Image not formatted\` / EXDEV on rename | overlay layer-directory rename is EXDEV by design (docker overlay2 parity); restructure the command |

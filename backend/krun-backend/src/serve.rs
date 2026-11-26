@@ -33,7 +33,8 @@ use std::time::{Duration, Instant};
 const VSOCK_FORWARD_BASE: u32 = 4200;
 const IDLE_EXIT_MS: u128 = 60_000;
 const AGENT_PING_INTERVAL_MS: u64 = 150;
-const BOOT_DEADLINE: Duration = Duration::from_secs(30);
+// First-boot guest setup may install Python/bash packages (apt on Ubuntu).
+const BOOT_DEADLINE: Duration = Duration::from_secs(180);
 
 struct Forward {
     stop: Arc<AtomicBool>,

@@ -13,6 +13,64 @@ MOUNT_NAMES="$*"
 
 set -e
 
+# Install a bounded set of packages in the guest's merged root. In rw mode this
+# writes to the persistent overlay; package files never go into the shared host
+# workspace or the read-only lower image. Ubuntu/Debian's minimal base may omit
+# gpgv, so bootstrap it once over HTTPS using the host CA bundle baked at boot;
+# after that, normal apt signature verification is required for all packages. Run
+# apt's helpers as root: minimal base images may not provision the _apt sandbox user.
+ensure_guest_tools() {
+  chroot /run/newroot /bin/sh -c '
+    need=""
+    for package in "$@"; do
+      case "$package" in
+        bash) command -v bash >/dev/null 2>&1 || need="$need bash" ;;
+        python3) command -v python3 >/dev/null 2>&1 || need="$need python3" ;;
+        *) echo "SETUP: unsupported required package: $package"; exit 26 ;;
+      esac
+    done
+    [ -z "$need" ] && { echo "SETUP: requested guest tools already available:$*"; exit 0; }
+    echo "SETUP: missing guest tools:$need"
+    if command -v apk >/dev/null 2>&1; then
+      set -- $need
+      apk add --no-cache "$@"
+    elif command -v apt-get >/dev/null 2>&1; then
+      export DEBIAN_FRONTEND=noninteractive
+      if ! command -v gpgv >/dev/null 2>&1 || ! gpgv --version >/dev/null 2>&1; then
+        if [ ! -s /etc/ssl/certs/ca-certificates.crt ]; then
+          echo "SETUP: apt bootstrap needs a trusted CA bundle, but none is installed"
+          exit 22
+        fi
+        for source in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+          [ -f "$source" ] || continue
+          sed -i "s#http://#https://#g" "$source"
+        done
+        apt-get -o APT::Sandbox::User=root -o Acquire::AllowInsecureRepositories=true update || exit 23
+        apt-get -o APT::Sandbox::User=root --allow-unauthenticated -o Acquire::AllowInsecureRepositories=true install -y --no-install-recommends gpgv || exit 24
+        command -v gpgv >/dev/null 2>&1 || { echo "SETUP: HTTPS bootstrap did not install gpgv"; exit 25; }
+        echo "SETUP: bootstrapped gpgv over verified HTTPS; enabling signed apt verification"
+      fi
+      # Minimal rootfs images may not provision the unprivileged _apt sandbox user.
+      # We are already inside the isolated VM; run apt helpers as root so gpgv can execute.
+      apt-get -o APT::Sandbox::User=root update
+      set -- $need
+      apt-get -o APT::Sandbox::User=root install -y --no-install-recommends "$@"
+      apt-get clean
+      rm -rf /var/lib/apt/lists/*
+    else
+      echo "SETUP: unsupported package manager; cannot install:$need"
+      exit 20
+    fi
+    for package in "$@"; do
+      case "$package" in
+        bash) command -v bash >/dev/null 2>&1 || exit 21 ;;
+        python3) command -v python3 >/dev/null 2>&1 || exit 21 ;;
+      esac
+    done
+    echo "SETUP: required guest tools installed successfully:$need"
+  ' krun-setup "$@"
+}
+
 # 1. 运行时挂载点基座（镜像根是只读的，全部建在 tmpfs 上）
 mount -t tmpfs tmpfs /run
 mkdir -p /run/newroot /run/data
@@ -22,7 +80,18 @@ if [ "$MODE" = rw ]; then
   # 数据层盘：宿主预格式化（raw 常规路径）或空白盘（qcow2 首次启动）时在 guest 内格式化
   if ! mount -t ext4 /dev/vda /run/data; then
     echo "SETUP: /dev/vda not formatted — mkfs in guest"
-    mkfs.ext4 -q /dev/vda
+    if ! command -v mkfs.ext4 >/dev/null 2>&1 && ! command -v mke2fs >/dev/null 2>&1; then
+      if ! ensure_guest_tools e2fsprogs; then
+        echo "SETUP: cannot format the VM data disk; install e2fsprogs or use a preformatted disk"
+        exit 1
+      fi
+    fi
+    mkfs_tool="$(command -v mkfs.ext4 || command -v mke2fs || true)"
+    if [ -z "$mkfs_tool" ]; then
+      echo "SETUP: missing e2fsprogs; provide a rootfs with mkfs.ext4 or mke2fs for qcow2 first boot"
+      exit 1
+    fi
+    "$mkfs_tool" -q /dev/vda
     mount -t ext4 /dev/vda /run/data
   fi
   mkdir -p /run/data/upper /run/data/work
@@ -78,7 +147,19 @@ if [ "$#" -gt 0 ]; then
   done
 fi
 
-# 6/7. 进入合成根：agent 模式常驻（VM 随 agent 退出而关机），否则执行一次性验证负载
+# 6. Ensure tools needed by this VM image. Packages install to the writable overlay
+#    (persisted in the workspace data disk), never into the host workspace or RO lower.
+if [ "$MODE" = rw ]; then
+  if ! ensure_guest_tools bash python3; then
+    echo "SETUP: bash/python3 installation failed; file management or bash execution may be unavailable"
+  fi
+else
+  if ! chroot /run/newroot /bin/sh -c 'command -v bash >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1'; then
+    echo "SETUP: read-only session; missing bash/python3 will not be installed"
+  fi
+fi
+
+# 7/8. 进入合成根：agent 模式常驻（VM 随 agent 退出而关机），否则执行一次性验证负载
 if [ "$AGENT" = agent ]; then
   echo "SETUP: agent branch taken"
   chroot /run/newroot /usr/bin/dsh-vm-agent

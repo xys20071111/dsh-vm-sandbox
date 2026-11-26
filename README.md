@@ -27,8 +27,12 @@
 - **诊断 skill**：`diagnose-krun-vm-sandbox`（全局 skill，排障路径 + 常见失败表）
 - **会话守护进程**：`serve`（默认开启，`daemon: false` 回退直 spawn）——跨进程共享会话
   （同 dataDir 的 live/headless 共用一 VM）、配置指纹漂移防线、boot 子进程监督、PDEATHSIG 孤儿回收
-- **管理页**：侧栏独立的“虚拟机管理”（环境/会话/镜像看板、工作区镜像绑定与网络档、额外只读目录挂载、虚拟机专用文件管理）+ composer 状态芯片。文件管理仅作用于 guest 持久目录 `/root/vm-files`，不会读写宿主文件系统；单文件传输上限 64 KiB（受 guest exec argv 长度限制）。
+- **管理页**：侧栏独立的“虚拟机管理”（环境/会话/镜像看板、工作区镜像绑定与网络档、额外只读目录挂载、虚拟机专用文件管理）+ composer 状态芯片。文件管理仅作用于 guest 持久目录 `/root/vm-files`，不会读写宿主文件系统；单文件传输上限 64 KiB（受 guest exec argv 长度限制）。guest 首次以读写模式启动时，会检测 `bash` 与 `python3`；缺少时用 Alpine `apk` 或 Ubuntu/Debian `apt-get` 安装到持久可写层。精简 Ubuntu/Debian 缺少 `gpgv` 时，安装器先用宿主 CA 根证书和 HTTPS 引导 `gpgv`，之后恢复 apt 签名校验；apt 辅助进程在隔离 VM 内以 root 运行，避免极简镜像缺少 `_apt` 用户时校验器无法启动。只读会话不会安装；缺少可信 CA、包管理器、仓库或网络时会记录提示并继续启动首次 apt 安装的启动等待上限为 180 秒；使用 qcow2 时 rootfs 仍需预置 `mkfs.ext4` 或 `mke2fs`。
 - **Agent rootfs 选择与 VM 创建**：`krun_vm` 工具列出可选镜像并允许 Agent 为当前工作区绑定所选 rootfs、设置网络/ro-rw 并启动 VM；只接受管理的镜像 ID，不接收任意宿主路径或 URL。无导入镜像时可用已配置 rootfs 或官方 Alpine 自动回退。
+
+## DSH 兼容性
+
+插件清单针对当前运行时 DSH `0.2.2-rc.5` 声明兼容，并依赖同版 `@deepseek-ai/dsh-sandbox`。该 VM provider 尚不支持 SandboxPolicy 的 `additionalWritableRoots`：出现此策略时会 fail-closed 返回 `SANDBOX_UNAVAILABLE`，不会静默忽略额外授权。
 
 ## 布局
 

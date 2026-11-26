@@ -26,6 +26,7 @@ import { SandboxProvider, SandboxUnavailableError, canonicalPath } from '@deepse
 import z from '@deepseek-ai/schemastery';
 import { KRUN_DIAGNOSIS_SKILL } from './diagnose-skill.js';
 import { GuestFiles } from './guest-files.js';
+import { bakeHostCaBundle } from './guest-tools.js';
 import { normalizeDnsServers, readDnsSettings, resolveHostDnsServers, writeDnsSettings, writeGuestResolvConf } from './dns-settings.js';
 
 const PKG_DIR = dirname(fileURLToPath(import.meta.url));
@@ -340,7 +341,8 @@ export class KrunSandboxProvider extends SandboxProvider {
       vcpus: z.natural().default(2),
       ramMib: z.natural().default(2048),
     }).default({ vcpus: 2, ramMib: 2048 }),
-    bootTimeoutMs: z.natural().default(20000),
+    // Ubuntu/Debian first-boot package setup may need time for apt metadata and downloads.
+    bootTimeoutMs: z.natural().default(180000),
     /** 会话空闲回收（毫秒）；0 = 常驻不回收。默认 10 分钟。 */
     idleStopMs: z.natural().default(600000),
     /** 网络档位：tsi = 共享宿主网络（guest 监听端口自动占宿主同号端口）；
@@ -1302,6 +1304,11 @@ export class KrunSandboxProvider extends SandboxProvider {
     chmodSync(setupDst, 0o755);
     // RO sessions cannot create these below the merged root, so bake mountpoints into the lower image.
     mkdirSync(join(imageRootfs, 'mnt', 'dsh-shares'), { recursive: true });
+    try {
+      if (bakeHostCaBundle(imageRootfs)) this.krunDiag('baked host CA roots into guest image');
+    } catch (err) {
+      this.krunDiag(`bake host CA roots FAILED: ${err?.message ?? err}`);
+    }
   }
 
   /** 会话守护进程连接（懒建；失败重 spawn，ping 为就绪判据）。单连接 + 调用串行队列。 */
@@ -1456,6 +1463,12 @@ export class KrunSandboxProvider extends SandboxProvider {
 
   /** 惰性引导一个会话；同 key 并发共享单次启动。 */
   async ensureSession(policy, signal) {
+    if (policy.mode === 'workspace-write' && policy.additionalWritableRoots?.length) {
+      throw new SandboxUnavailableError(
+        policy.mode,
+        'krun VM does not yet implement policy.additionalWritableRoots; remove the extra roots or use a backend that supports them',
+      );
+    }
     const ws = canonicalPath(policy.workspaceRoot);
     const mode = policy.mode === 'read-only' ? 'ro' : 'rw';
     const key = sessionKey(ws, mode);

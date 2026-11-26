@@ -1,7 +1,7 @@
 {
   "name": "@local/dsh-krun-vm",
   "description": "libkrun microVM sandbox backend for the DeepSeek Harness sandbox seam: confined bash/pwsh commands run inside a lightweight VM with the workspace bind-mounted read-write",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "private": true,
   "type": "module",
   "main": "index.js",
@@ -17,6 +17,7 @@
   "files": [
     "index.js",
     "guest-files.js",
+    "guest-tools.js",
     "dns-settings.js",
     "terminal-backend.js",
     "client.js",
@@ -29,11 +30,11 @@
     "diagnose-skill.js"
   ],
   "engines": {
-    "dsh": "0.2.2-rc.1"
+    "dsh": "0.2.2-rc.5"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "~4.1.0",
-    "@deepseek-ai/dsh-sandbox": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-sandbox": "0.2.2-rc.5",
     "@deepseek-ai/schemastery": "^3.19.0"
   },
   "dsh": {
