@@ -1,8 +1,8 @@
 # krun VM sandbox — DeepSeek Harness 的 libkrun microVM 沙盒插件
 
-把 DSH（DeepSeek Harness）的 sandbox 接缝替换为 libkrun microVM 后端：受限命令在
-独立内核的轻量 VM 内执行，工作区以同绝对路径双向共享，系统级副作用持久化在
-"工作区数据层"（ext4 稀疏盘，guest 内 overlay upper），镜像层只读可复用。
+接管 DSH（DeepSeek Harness）的 sandbox 接缝，并提供会话权限选项，在 DSH 原生宿主沙盒与
+libkrun microVM 之间路由受限 shell 命令。VM 内工作区以同绝对路径双向共享，系统级副作用
+持久化在“工作区数据层”（ext4 稀疏盘，guest 内 overlay upper），镜像层只读可复用。
 
 完整设计、实测记录与验证清单见 **[krun-vm-sandbox-design.md](krun-vm-sandbox-design.md)**
 （附录 C = 实测记录；附录 D = 验证 TODO）。
@@ -30,9 +30,24 @@
 - **管理页**：侧栏独立的“虚拟机管理”（环境/会话/镜像看板、工作区镜像绑定与网络档、额外只读目录挂载、虚拟机专用文件管理）+ composer 状态芯片。文件管理仅作用于 guest 持久目录 `/root/vm-files`，不会读写宿主文件系统；单文件传输上限 64 KiB（受 guest exec argv 长度限制）。guest 首次以读写模式启动时，会检测 `bash` 与 `python3`；缺少时用 Alpine `apk` 或 Ubuntu/Debian `apt-get` 安装到持久可写层。精简 Ubuntu/Debian 缺少 `gpgv` 时，安装器先用宿主 CA 根证书和 HTTPS 引导 `gpgv`，之后恢复 apt 签名校验；apt 辅助进程在隔离 VM 内以 root 运行，避免极简镜像缺少 `_apt` 用户时校验器无法启动。只读会话不会安装；缺少可信 CA、包管理器、仓库或网络时会记录提示并继续启动首次 apt 安装的启动等待上限为 180 秒；使用 qcow2 时 rootfs 仍需预置 `mkfs.ext4` 或 `mke2fs`。
 - **Agent rootfs 选择与 VM 创建**：`krun_vm` 工具列出可选镜像并允许 Agent 为当前工作区绑定所选 rootfs、设置网络/ro-rw 并启动 VM；只接受管理的镜像 ID，不接收任意宿主路径或 URL。无导入镜像时可用已配置 rootfs 或官方 Alpine 自动回退。
 
-## DSH 兼容性
+## DSH 兼容性与权限选项
 
-插件清单针对当前运行时 DSH `0.2.2-rc.5` 声明兼容，并依赖同版 `@deepseek-ai/dsh-sandbox`。该 VM provider 尚不支持 SandboxPolicy 的 `additionalWritableRoots`：出现此策略时会 fail-closed 返回 `SANDBOX_UNAVAILABLE`，不会静默忽略额外授权。
+插件清单针对当前运行时 DSH `0.2.2-rc.5` 声明兼容，并依赖同版 `@deepseek-ai/dsh-sandbox` 与
+`@deepseek-ai/dsh-sandbox-local`。插件自身是唯一公开的 `ctx.sandbox` provider；原生 provider
+在独立 Cordis sandbox scope 内实例化，路由不会注册第二个同名服务。
+
+权限预设 `host-sandbox` 与 `virtual-machine` 用相同的 `workspace-write + never` 文件/审批策略，
+只用持久化的 preset identity 区分 shell 后端。其他 preset 使用 `defaultBackend`（默认 `vm`）。
+切到 `danger-full-access` 时 DSH 按原约定绕过 sandbox provider。
+
+**配置注意**：Loader 对目标行的 `config` 是整体替换，不做深合并。插件补丁为权限服务重列了
+DSH 默认的 `workspace-write`、`danger-full-access` 和两个后端选项；若你已有自定义权限预设，
+启用此补丁时需把它们合并进 `permission` 行的 `presets` 表。`defaultPreset` 未覆盖，仍由当前
+组合的 sandbox/approval 默认值推导。
+
+边界：本次后端选项只路由受限 shell 命令。Harness 文件工具仍由 DSH 的宿主文件系统策略处理，
+Web/侧栏 PTY 终端仍固定走 VM 后端；它们不会因选择 `host-sandbox` 而自动迁移。VM 仍不支持
+`additionalWritableRoots`，遇到该策略会 fail-closed 返回 `SANDBOX_UNAVAILABLE`，不静默忽略额外授权。
 
 ## 布局
 
@@ -42,7 +57,7 @@
 | `backend/krun-backend/` | 宿主侧 Rust：`probe` / `boot`（每会话一 VM 子进程，PDEATHSIG 绑父）/ `exec`（agent 客户端，exec2 帧解包）/ `serve`（**会话守护进程**：注册表/监督/gc/端口转发监听，协议见 serve.rs） |
 | `backend/guest/dsh-vm-agent/` | guest 内代理（musl static-pie）：vsock:42 上的 exec（fork/execve + env 透传）、exec2（stdout/stderr/退出码帧分离）、term（PTY + OSC 7777 resize）、vsock 端口转发中继、stat（活跃连接）；全 fd CLOEXEC |
 | `backend/vendor/libkrun/` | **git submodule**：containers/libkrun `stable-1.19.x`，锁定 1.19.8 发布点（c4d283c2）；path 依赖 `src/libkrun`，可打补丁 |
-| `plugin/` | `@local/dsh-krun-vm` 插件：`index.js`（SandboxProvider + /vm 命令 + 管理 API + 端口转发监听 + 空闲回收）、`guest-files.js`（VM 内安全文件操作）、`diagnose-skill.js`（诊断 skill）、`terminal-backend.js`（persistent-shell 组内注册器）、`client.js`（侧栏虚拟机管理、文件/挂载页面 + 状态芯片）、`guest/setup.sh`（guest 内三层编排 + 首启格式化）、`bin/krun`（侧栏终端桥）、`bin/krun-backend`、`guest/dsh-vm-agent{-aarch64,}`（构建产物，已忽略） |
+| `plugin/` | `@local/dsh-krun-vm` 插件：`index.js`（sandbox 路由 provider + 原生 provider 隔离实例 + /vm 命令/API）、`backend-routing.js`（权限预设身份映射）、`guest-files.js`、`diagnose-skill.js`、`terminal-backend.js`、`client.js`、guest 启动脚本与后端二进制 |
 | `m0/` | 可行性尖峰：FFI 探针 / 引导冒烟（koffi 路线已弃用的实证） |
 | `harness/` | 接线工件：`krun-overlay.yml`（dsh --patch 用）、`krun-preset-override.yml`（三预设覆写生成物）、`krun-overlay-headless-*.yml`（headless 验证 overlay） |
 | `scripts/build.sh` | 构建并部署二进制到 `plugin/`（x86_64 + best-effort aarch64 agent） |
@@ -60,7 +75,8 @@ scripts/build.sh
 
 `~/.dsh/profiles/web/cordis.patch.yml`：
 
-1. disable base bundle 的 `sandbox` 行 + insert `sandbox-vm`（provider 替换，network: none）
+1. 启用 `sandbox-vm` 路由 provider（它使用隔离 scope 内的原生 provider；公开 `sandbox` 行必须禁用）。
+   插件补丁添加 `host-sandbox` / `virtual-machine` 权限项；已有自定义 preset 时需合并进权限表。
 2. `preset-minimal` / `preset-standard` / `preset-ptc` 三预设覆写（persistent-shell 组内
    注册 krun 终端后端；**cordis/创造模式未动**）。preset 为快照，dsh 更新后用
    `harness/krun-preset-override.yml` 头部的生成方式重新生成。

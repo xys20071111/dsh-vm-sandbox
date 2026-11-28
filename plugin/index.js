@@ -23,7 +23,9 @@ import { fileURLToPath } from 'node:url';
 import { homedir, tmpdir } from 'node:os';
 
 import { SandboxProvider, SandboxUnavailableError, canonicalPath } from '@deepseek-ai/dsh-sandbox';
+import { LocalSandboxProvider } from '@deepseek-ai/dsh-sandbox-local';
 import z from '@deepseek-ai/schemastery';
+import { permissionPresetOf, resolveSandboxBackend } from './backend-routing.js';
 import { KRUN_DIAGNOSIS_SKILL } from './diagnose-skill.js';
 import { GuestFiles } from './guest-files.js';
 import { bakeHostCaBundle } from './guest-tools.js';
@@ -320,15 +322,17 @@ async function runImportJob(dataDir, job, req, diag = () => {}) {
 
 export class KrunSandboxProvider extends SandboxProvider {
   // cordis 4.1：ctx 上未声明的服务属性访问直接抛错（"cannot get property … without inject"）。
-  // timer 由 base bundle 提供（@deepseek-ai/cordis-plugin-timer）；
-  // workingDirectory 为根作用域服务，供终端 spawn 时解析会话工作目录。
+  // timer 由 base bundle 提供；workingDirectory 供终端解析工作目录；sessions 用于
+  // 从当前 Session 的已记录 permission/preset 事件选择 sandbox 后端。
   // 注意：terminals 服务被 web-app 的 persistent-shell 组 isolate（每 shell 组独立实例），
   // 根作用域 inject 永远等不到——krun 终端后端由 ./terminal-backend.js 经
   // persistent-shell 组的 insert 补丁在该组内注册（见 cordis.patch.yml）。
-  static inject = ['timer', 'workingDirectory'];
+  static inject = ['timer', 'workingDirectory', 'sessions'];
 
   static Config = z.object({
     enabled: z.boolean().default(true),
+    /** Fallback for agentless calls and sessions with non-plugin permission presets. */
+    defaultBackend: z.union([z.const('native'), z.const('vm')]).default('vm'),
     /** 准备好的 Linux rootfs 目录树（只读使用）。空 = 未配置 → fail-closed。 */
     imageRootfs: z.string().default(''),
     /** krun-backend 二进制路径；空 = 使用包内 bin/krun-backend。 */
@@ -376,6 +380,14 @@ export class KrunSandboxProvider extends SandboxProvider {
     super(ctx);
     this.krunConfig = config;
     this.krunCtx = ctx;
+    // Keep the official host runner available without registering a second
+    // `sandbox` service in the router's scope. Cordis gives the nested context
+    // an independent sandbox service namespace; the direct instance reference
+    // below is the only route into that backend.
+    this.krunNativeSandbox = new LocalSandboxProvider(
+      ctx.isolate('sandbox'),
+      { runnerCommand: [], runnerFailureSignatures: [], probeTimeoutMs: 5000 },
+    );
     this.krunDataDir = resolveDataDir(config, (m) => this.krunDiag(m));
     this.krunDnsServers = readDnsSettings(this.krunDataDir, config.dnsServers ?? []);
     this.krunBackendPath = expandHome(config.backendPath || join(PKG_DIR, 'bin', 'krun-backend'));
@@ -1704,8 +1716,20 @@ export class KrunSandboxProvider extends SandboxProvider {
     }
   }
 
-  /** sandbox 接缝：把 argv 包装为 krun-exec 客户端调用。 */
+  /** Resolve this call's backend from the durable permission preset identity. */
+  krunSandboxBackend(policy) {
+    const sessionId = policy.sessionId;
+    const session = sessionId ? this.krunCtx.sessions.get(sessionId) : undefined;
+    const preset = session ? permissionPresetOf(session) : undefined;
+    return resolveSandboxBackend(preset, this.krunConfig.defaultBackend);
+  }
+
+  /** sandbox 接缝：按会话权限预设路由到宿主原生沙盒或 krun VM。 */
   async confine(argv, policy, signal) {
+    const backend = this.krunSandboxBackend(policy);
+    if (backend === 'native') {
+      return this.krunNativeSandbox.confine(argv, policy, signal);
+    }
     if (policy.mode === 'danger-full-access') {
       // executor 约定危险模式直接绕过 provider；到达此处属防御性错误
       throw new SandboxUnavailableError(policy.mode, 'danger-full-access must bypass the sandbox provider');

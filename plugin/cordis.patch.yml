@@ -1,8 +1,38 @@
-# Install the VM provider as a bundle-owned row. The profile must disable the
-# base `sandbox` row before enabling this provider because both supply ctx.sandbox.
+# The plugin owns the single public ctx.sandbox service and routes by the
+# selected permission preset. Its private native provider runs in an isolated
+# Cordis sandbox scope. When enabling sandbox-vm in a profile, disable the stock
+# `sandbox` row there so only this router provides the public service.
 - insert:
     - id: sandbox-vm
       name: '@local/dsh-krun-vm'
       disabled: true
       config:
         enabled: true
+        defaultBackend: vm
+
+# Permission preset identity is the durable per-session backend selector.
+# Re-state the stock presets because Loader row config is replaced, not merged.
+- id: permission
+  name: '@deepseek-ai/dsh-permission-presets'
+  config:
+    presets:
+      workspace-write:
+        sandbox: workspace-write
+        approval: ask
+        name: workspace-write
+        description: Write inside the workspace; wider retries require approval.
+      danger-full-access:
+        sandbox: danger-full-access
+        approval: never
+        name: danger-full-access
+        description: Full file access without approval prompts.
+      virtual-machine:
+        sandbox: workspace-write
+        approval: never
+        name: Virtual machine sandbox (krun)
+        description: Run confined shell commands inside the krun microVM; do not ask for approval.
+      host-sandbox:
+        sandbox: workspace-write
+        approval: never
+        name: Host sandbox (native)
+        description: Run confined shell commands with DSH's built-in host sandbox; do not ask for approval.

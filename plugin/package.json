@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-krun-vm",
-  "description": "libkrun microVM sandbox backend for the DeepSeek Harness sandbox seam: confined bash/pwsh commands run inside a lightweight VM with the workspace bind-mounted read-write",
+  "description": "Selectable host-native or libkrun microVM sandbox routing for the DeepSeek Harness sandbox seam",
   "version": "0.1.2",
   "private": true,
   "type": "module",
@@ -19,6 +19,7 @@
     "guest-files.js",
     "guest-tools.js",
     "dns-settings.js",
+    "backend-routing.js",
     "terminal-backend.js",
     "client.js",
     "cordis.patch.yml",
@@ -35,6 +36,7 @@
   "peerDependencies": {
     "@deepseek-ai/cordis": "~4.1.0",
     "@deepseek-ai/dsh-sandbox": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-sandbox-local": "0.2.2-rc.5",
     "@deepseek-ai/schemastery": "^3.19.0"
   },
   "dsh": {
